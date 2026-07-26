@@ -1,0 +1,33 @@
+{
+  "name": "4designer-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit",
+    "test:e2e": "npm run build && playwright test",
+    "test:e2e:ui": "npm run build && playwright test --ui",
+    "capture:readme": "npx --yes tsx scripts/capture-readme.ts"
+  },
+  "dependencies": {
+    "@quantumaudio/ableton-extension-sdk": "github:QaAudio/qa-ableton-extension-sdk#0319277370b98e3051517b05462634e4d44f1f77",
+    "splitpanes": "^4.1.2",
+    "three": "^0.172.0",
+    "vue": "^3.5.13",
+    "vue-material-design-icons": "^5.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@types/three": "^0.172.0",
+    "@vitejs/plugin-vue": "^5.2.4",
+    "typescript": "^5.9.3",
+    "vite": "^6.3.5",
+    "vue-tsc": "^2.2.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
