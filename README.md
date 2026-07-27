@@ -25,7 +25,7 @@
 
 [![4designer demo — grabbing a geo in the browser while the TouchDesigner render updates live](docs/img/demo.gif)](docs/demo.mp4)
 
-<sub>▶ **[Watch the full-quality video](docs/demo.mp4)** · Outliner on the left, gizmos in the middle, live TD render in the corner. Nothing was saved, reloaded, or re-cooked by hand.</sub>
+<sub>▶ **[Watch the full-quality video](docs/demo.mp4)** · Outliner on the left, gizmos in the middle, in the other hand TD stay open/playing and reflect editor's change live + there is a usefull preview in the browser that mirror the selected render's output. Nothing was saved, reloaded, or re-cooked by hand.</sub>
 
 </div>
 
