@@ -309,6 +309,16 @@ npm run test:e2e
 
 Specs: `smoke`, `render`, `transform`, `ws`, `workspaces`, `undo`, `empty`.
 
+## Media (README assets)
+
+| Asset | Regen |
+|-------|-------|
+| `docs/demo.mp4` | `ffmpeg -i <raw>.mp4 -an -vf "scale=1280:-2:flags=lanczos" -c:v libx264 -preset slow -crf 27 -pix_fmt yuv420p -movflags +faststart docs/demo.mp4` |
+| `docs/img/demo.gif` (README hero, loops) | `ffmpeg -i <raw>.mp4 -vf "fps=12,scale=900:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3" -loop 0 docs/img/demo.gif` |
+| Live UI still | `cd frontend && npm run capture:readme` (daemon must be up) → `docs/img/fourdesigner-hero.png` |
+
+Keep both demo files under ~1 MB each so clones stay light.
+
 ## Deferred (out of v1.0.0)
 
 - Daemon-restart persistence (marshals re-register on reconnect)
