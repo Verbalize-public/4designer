@@ -1,107 +1,1110 @@
-"""FourdesignerExt — hub extension: daemon lifecycle + WS set_trs fan-in."""
+"""4designer Extension — discover, select, drag, camera, idle-lock.
 
-import importlib.util
-import os
-import uuid
-from pathlib import Path
+Discovery (`_expand_render_par` / `_classify_render_op`) resolves a Render
+TOP's geometry/lights/camera parameters into a flat pick table; the world-AABB
+technique (`computeBounds(display=True, render=True, recurse=True)` +
+`.min`/`.max`) gives each entry a world-space bounding box for ray picking.
+Everything downstream of discovery (selection, drag, camera, idle-lock) is
+analytic CPU ray math only — no Render Pick DAT, no Multi Touch In DAT, no
+external process.
 
-DETACHED_PROCESS = 0x00000008
-CREATE_NEW_PROCESS_GROUP = 0x00000200
-CREATE_NO_WINDOW = 0x08000000
+Pick targets: Geometry COMPs (mesh AABB) plus light/camera COMPs via unlit
+proxy Geometry icons under `proxies/`. Scale mode is geo-only; lights/cameras
+fall back to translate handles.
 
+Known MVP limitation: translate/scale assume the selected Object COMP has
+no Object-COMP parent (its tx/ty/tz are effectively world space). Rotate is
+fully correct for Rotate Order 'xyz' (TD's default); other orders still get
+an incremental, gimbal-safe update but are decomposed via the xyz formula as
+a documented fallback (flagged in Status, not silent).
+"""
+from __future__ import annotations
 
-def _mixin_bases():
-	names = [
-		('hub_lifecycle', 'HubLifecycleMixin'),
-		('shm_drain', 'ShmDrainMixin'),
-		('render_snapshot', 'RenderSnapshotMixin'),
-		('marshal_registry', 'MarshalRegistryMixin'),
-	]
-	bases = []
-	# TD embedded path: sibling Text DATs next to fourdesigner_ext
-	try:
-		parent = me.parent()  # type: ignore[name-defined]
-		for dat_name, cls_name in names:
-			dat = parent.op(dat_name)
-			if dat is not None:
-				bases.append(getattr(dat.module, cls_name))
-		if len(bases) == 4:
-			return tuple(bases)
-	except Exception:
-		pass
-	# Disk path (td/ext/*.py)
-	bases = []
-	ext_dir = Path(__file__).resolve().parent / 'ext'
-	for dat_name, cls_name in names:
-		path = ext_dir / f'{dat_name}.py'
-		spec = importlib.util.spec_from_file_location(f'fd_ext_{dat_name}', path)
-		if spec is None or spec.loader is None:
-			raise ImportError(f'missing mixin: {path}')
-		mod = importlib.util.module_from_spec(spec)
-		spec.loader.exec_module(mod)
-		bases.append(getattr(mod, cls_name))
-	return tuple(bases)
+import math
+
+# Visual-only near-pivot hover id — not a real HANDLES entry / not draggable.
+CENTER_HOVER_ID = "center"
 
 
-_BASES = _mixin_bases()
-
-
-class FourdesignerExt(*_BASES):
-	SPAWN_COOLDOWN_S = 30
-	PRUNE_GROUP = 'fourdesigner_prune'
-	PRUNE_PERIOD_FRAMES = 1800  # ~30s at 60fps — orphan sweep only
-	PRUNE_PERIOD_SHM_DOWN = 300  # fallback pending poll when SHM unavailable
-
+class FourdesignerExt:
 	def __init__(self, ownerComp):
 		self.ownerComp = ownerComp
-		self.State = {}
-		self.Connected = False
-		self._retry_fails = 0
-		self._last_spawn = 0.0
-		self._path_by_id = {}
-		self._path_by_hash = {}
-		self._shm = None
-		self._shm_slug = ''
-		self._shm_epoch = -1
-		self._shm_last_trs_seq = -1
-		self._shm_last_cmd_seq = -1
-		self._shm_last_gen = [0] * 512
-		self._shm_trs_pending = False
-		self._shm_open_fails = 0
-		self._prune_ticks = 0
-		self._pending_http_count = 0  # exit-criteria counter (idle should stay 0 when SHM ok)
-		self._orphan_suspects = {}  # oid → first_seen time for PruneOrphans debounce
-		self._ensure_workspace_id()
-		# Ext reinit resets Connected while the Websocket DAT can stay peer-live.
-		run("args[0]._recover_ws_hello()", self, delayFrames=2)
-		run("args[0]._recover_ws_hello()", self, delayFrames=45)
+		# Pick table: {path, kind, min, max} — kind is geo | light | camera.
+		self.Objects = []
+		self.Selected = None
+		self.Drag = None
+		self.Hovered = None
+		self.Orbit = {"yaw": -25.0, "pitch": 20.0, "dist": 6.0, "pivot": (0.0, 0.0, 0.0)}
+		self.CamSeeded = False
+		self._orbit_last = None
+		self._pan_last = None
+		self._lsel_prev = 0
+		self._rsel_prev = 0
+		self._msel_prev = 0
+		# Panel u/v often lag the button-down edge; arm after the first sample
+		# while held so pick/orbit/pan never fire on a stale UV.
+		self._lmb_armed = False
+		self._orbit_armed = False
+		self._pan_armed = False
+		self.OrientHovered = None
 
-	def _ensure_workspace_id(self):
-		par = getattr(self.ownerComp.par, 'Workspaceid', None)
+	# ---- module / node access ----
+	@property
+	def gm(self):
+		return self.ownerComp.op("gizmo_math").module
+
+	@property
+	def rig(self):
+		return self.ownerComp.op("gizmo_rig").module
+
+	@property
+	def icons(self):
+		return self.ownerComp.op("proxy_icons").module
+
+	@property
+	def toolbar_mod(self):
+		dat = self.ownerComp.op("toolbar")
+		return dat.module if dat is not None else None
+
+	@property
+	def orient(self):
+		dat = self.ownerComp.op("orient_gizmo")
+		return dat.module if dat is not None else None
+
+	@property
+	def cam(self):
+		return self.ownerComp.op("cam_edit")
+
+	@property
+	def cam_orient(self):
+		return self.ownerComp.op("cam_orient")
+
+	@property
+	def render_edit(self):
+		return self.ownerComp.op("render_edit")
+
+	@property
+	def render_gizmo(self):
+		return self.ownerComp.op("render_gizmo")
+
+	@property
+	def render_orient(self):
+		return self.ownerComp.op("render_orient")
+
+	@property
+	def gizmo(self):
+		return self.ownerComp.op("gizmo1")
+
+	@property
+	def orient_cube(self):
+		return self.ownerComp.op("orient_cube")
+
+	@property
+	def proxies(self):
+		return self.ownerComp.op("proxies")
+
+	@property
+	def toolbar(self):
+		return self.ownerComp.op("ui_toolbar")
+
+	@property
+	def ui_orient(self):
+		return self.ownerComp.op("ui_orient")
+
+	@property
+	def panel(self):
+		"""The owner COMP is itself the interactive Container/Panel -- one
+		node, one drop-in tox, no separate child panel to keep in sync."""
+		return self.ownerComp
+
+	# Back-compat for any external reader that still expects Geos.
+	@property
+	def Geos(self):
+		return [e for e in self.Objects if e.get("kind") == "geo"]
+
+	def _status(self, msg):
+		try:
+			self.ownerComp.par.Status = str(msg)[:120]
+		except Exception:
+			pass
+
+	def _current_mode(self):
+		try:
+			return self.ownerComp.par.Mode.eval()
+		except Exception:
+			return "translate"
+
+	# ---- G2 Discover ----
+	def _expand_render_par(self, par):
+		"""Resolve a Render TOP OP/list parameter into a list of OPs."""
 		if par is None:
+			return []
+		try:
+			val = par.eval()
+		except Exception:
+			return []
+		if val is None:
+			return []
+		if isinstance(val, (list, tuple)):
+			return [x for x in val if x is not None]
+		if hasattr(val, "path"):
+			return [val]
+		return []
+
+	def _classify_render_op(self, o):
+		try:
+			if isinstance(o, cameraCOMP):
+				return "camera"
+			if isinstance(o, geometryCOMP):
+				return "geo"
+			if isinstance(o, lightCOMP):
+				return "light"
+		except Exception:
+			pass
+		opt = (getattr(o, "OPType", "") or type(o).__name__ or "").lower()
+		if "camera" in opt:
+			return "camera"
+		if "light" in opt:
+			return "light"
+		if "geometry" in opt or opt.endswith("geo"):
+			return "geo"
+		return None
+
+	def _compute_world_bounds(self, geo):
+		"""World-space AABB via `computeBounds`, kept in world space since
+		the ray test below operates in world space too.
+		"""
+		try:
+			b = geo.computeBounds(display=True, render=True, recurse=True)
+			mn, mx = b.min, b.max
+			return (float(mn.x), float(mn.y), float(mn.z)), (float(mx.x), float(mx.y), float(mx.z))
+		except Exception:
+			p = self.gm.object_world_position(geo)
+			return (p[0] - 0.5, p[1] - 0.5, p[2] - 0.5), (p[0] + 0.5, p[1] + 0.5, p[2] + 0.5)
+
+	def _icon_world_bounds(self, obj):
+		"""Fixed-radius AABB around an Object COMP origin (lights / cameras)."""
+		half = self.icons.ICON_HALF
+		p = self.gm.object_world_position(obj)
+		return (
+			(p[0] - half, p[1] - half, p[2] - half),
+			(p[0] + half, p[1] + half, p[2] + half),
+		)
+
+	def _object_bounds(self, obj, kind):
+		if kind == "geo":
+			return self._compute_world_bounds(obj)
+		return self._icon_world_bounds(obj)
+
+	def _object_entry(self, path):
+		for entry in self.Objects:
+			if entry["path"] == path:
+				return entry
+		return None
+
+	def _selected_kind(self):
+		entry = self._object_entry(self.Selected) if self.Selected else None
+		return entry["kind"] if entry else None
+
+	def _effective_mode(self):
+		"""Gizmo mode for the current selection — scale is geo-only."""
+		mode = self._current_mode()
+		kind = self._selected_kind()
+		if kind in ("light", "camera") and mode == "scale":
+			return "translate"
+		return mode
+
+	def Discover(self):
+		rt_par = getattr(self.ownerComp.par, "Rendertop", None)
+		rt = rt_par.eval() if rt_par is not None else None
+		if rt is None:
+			self._status("Discover: no Rendertop set")
+			self.Objects = []
+			self._rebuild_proxies([], [])
+			return []
+		geos, lights, cams = [], [], []
+		for par_name in ("geometry", "lights", "camera"):
+			p = getattr(rt.par, par_name, None)
+			for o in self._expand_render_par(p):
+				kind = self._classify_render_op(o)
+				if kind == "geo":
+					geos.append(o)
+				elif kind == "light":
+					lights.append(o)
+				elif kind == "camera":
+					cams.append(o)
+		table = []
+		for g in geos:
+			bmin, bmax = self._object_bounds(g, "geo")
+			table.append({"path": g.path, "kind": "geo", "min": bmin, "max": bmax})
+		for lit in lights:
+			bmin, bmax = self._object_bounds(lit, "light")
+			table.append({"path": lit.path, "kind": "light", "min": bmin, "max": bmax})
+		for cam in cams:
+			bmin, bmax = self._object_bounds(cam, "camera")
+			table.append({"path": cam.path, "kind": "camera", "min": bmin, "max": bmax})
+		self.Objects = table
+		self._rebuild_proxies(lights, cams)
+		self._wire_edit_render(geos, lights)
+		if not self.CamSeeded and cams:
+			self.SeedCamera(cams[0])
+		self._status(
+			"Discover: {} geo / {} light / {} cam".format(len(geos), len(lights), len(cams))
+		)
+		return table
+
+	def _rebuild_proxies(self, lights, cams):
+		icons = self.icons
+		root = icons.ensure_proxies_root(self.ownerComp, "proxies")
+		icons.clear_proxies(root)
+		for lit in lights:
+			try:
+				icons.build_light_proxy(root, lit)
+			except Exception as e:
+				self._status("proxy light fail: " + str(e)[:50])
+		for cam in cams:
+			try:
+				icons.build_camera_proxy(root, cam)
+			except Exception as e:
+				self._status("proxy cam fail: " + str(e)[:50])
+		self._refresh_camera_proxy_visibility()
+
+	def _refresh_camera_proxy_visibility(self):
+		"""Hide translucent camera glyphs when they sit on the edit camera."""
+		try:
+			self.icons.update_camera_proxy_visibility(self.proxies, self.cam, self.gm)
+		except Exception:
+			pass
+
+	def _sync_all_proxies(self):
+		root = self.proxies
+		if root is None:
 			return
-		cur = str(par.eval() or '').strip()
-		if not cur:
-			par.val = str(uuid.uuid4())
+		icons = self.icons
+		for entry in self.Objects:
+			if entry["kind"] not in ("light", "camera"):
+				continue
+			target = op(entry["path"])
+			proxy = icons.find_proxy_for(root, entry["path"])
+			if target is not None and proxy is not None:
+				icons.sync_proxy_transform(proxy, target)
+		self._refresh_camera_proxy_visibility()
 
-	@property
-	def WorkspaceId(self):
-		par = getattr(self.ownerComp.par, 'Workspaceid', None)
-		if par is None:
-			return ''
-		wid = str(par.eval() or '').strip()
-		if not wid:
-			self._ensure_workspace_id()
-			wid = str(par.eval() or '').strip()
-		return wid
+	def _gizmo_geometry_paths(self):
+		"""Explicit paths for the gizmo pass — nested handle/guide Geometry
+		COMPs must be listed individually; parent nullCOMP path alone is not
+		enough and must NOT be included (Render TOP geometry rejects it)."""
+		gizmo = self.gizmo
+		if gizmo is None:
+			return []
+		paths = []
+		for child in gizmo.children:
+			try:
+				if child.family == "COMP" and child.OPType == "geometryCOMP" and (
+					child.name.startswith("handle_") or child.name.startswith("guide_")
+				):
+					paths.append(child.path)
+			except Exception:
+				pass
+		return paths
 
-	@property
-	def BaseUrl(self):
-		return self.ownerComp.par.Daemonurl.eval().rstrip('/')
+	def _wire_gizmo_render(self):
+		"""Assign handle Geometry COMPs to render_gizmo.
 
-	@property
-	def DaemonDir(self):
-		d = self.ownerComp.par.Daemondir.eval()
-		if os.path.isabs(d):
-			return d
-		return os.path.join(project.folder, d)
+		TD's Render TOP `geometry` par silently drops COMPs whose `.render` is
+		False (and rejects nullCOMPs). Force-render on → assign → restore mode
+		visibility so inactive handles stay in the list and can be toggled later.
+		"""
+		rend_g = self.render_gizmo
+		gizmo = self.gizmo
+		if rend_g is None or gizmo is None:
+			return
+		paths = self._gizmo_geometry_paths()
+		if not paths:
+			return
+		# Remember current render flags, force on, assign, restore.
+		prev = {}
+		for child in gizmo.children:
+			try:
+				if child.name.startswith("handle_") or child.name.startswith("guide_"):
+					prev[child.path] = bool(child.render)
+					child.render = True
+			except Exception:
+				pass
+		try:
+			rend_g.par.geometry = " ".join(paths)
+		except Exception as e:
+			self._status("wire gizmo fail: " + str(e)[:60])
+		for path, flag in prev.items():
+			node = op(path)
+			if node is not None:
+				try:
+					node.render = flag
+				except Exception:
+					pass
+		# Re-apply mode so visibility matches current Mode/selection.
+		if self.Selected is not None and self._current_mode() != "select":
+			self.rig.set_gizmo_mode(gizmo, self._effective_mode())
+		elif self._current_mode() == "select" or self.Selected is None:
+			self.rig.set_gizmo_mode(gizmo, None)
+
+	def _wire_edit_render(self, geos, lights):
+		# Scene pass: Geos + light/camera proxy icons. Real lights still light
+		# the scene. Gizmo pass: handles only, composited Over.
+		rend = self.render_edit
+		rend_g = self.render_gizmo
+		light_paths = " ".join(l.path for l in lights)
+		geo_paths = [g.path for g in geos]
+		geo_paths.extend(self.icons.proxy_paths(self.proxies))
+		if rend is not None:
+			try:
+				rend.par.geometry = " ".join(geo_paths)
+			except Exception as e:
+				self._status("wire geometry fail: " + str(e)[:60])
+			try:
+				rend.par.lights = light_paths
+			except Exception as e:
+				self._status("wire lights fail: " + str(e)[:60])
+		if rend_g is not None:
+			try:
+				rend_g.par.lights = light_paths
+			except Exception:
+				pass
+			self._wire_gizmo_render()
+		self.Unlock()
+
+	# ---- G3 Select (analytic) ----
+	def _render_res_w(self):
+		try:
+			return float(self.render_edit.par.resolutionw.eval())
+		except Exception:
+			return 1280.0
+
+	def _render_res_h(self):
+		try:
+			return float(self.render_edit.par.resolutionh.eval())
+		except Exception:
+			return 720.0
+
+	def _panel_size(self):
+		p = self.ownerComp
+		try:
+			w = float(p.width)
+			h = float(p.height)
+			if w > 1.0 and h > 1.0:
+				return w, h
+		except Exception:
+			pass
+		return self._render_res_w(), self._render_res_h()
+
+	def _ray_from_panel(self, u, v):
+		# Remap panel u/v through topfill=best letterbox so rays match pixels.
+		res_w, res_h = self._render_res_w(), self._render_res_h()
+		panel_w, panel_h = self._panel_size()
+		u_c, v_c = self.gm.panel_uv_to_content(u, v, panel_w, panel_h, res_w, res_h)
+		return self.gm.unproject_ray(self.cam, u_c, v_c, res_w, res_h)
+
+	def _refresh_object_bounds(self, path=None):
+		"""Recompute cached world AABBs after transforms (Discover caches once)."""
+		for entry in self.Objects:
+			if path is not None and entry["path"] != path:
+				continue
+			obj = op(entry["path"])
+			if obj is None:
+				continue
+			bmin, bmax = self._object_bounds(obj, entry["kind"])
+			entry["min"], entry["max"] = bmin, bmax
+
+	def SelectAt(self, u, v):
+		self._refresh_object_bounds()
+		origin, direction = self._ray_from_panel(u, v)
+		best_path, best_t = None, None
+		for entry in self.Objects:
+			t = self.gm.ray_vs_aabb(origin, direction, entry["min"], entry["max"])
+			if t is not None and (best_t is None or t < best_t):
+				best_t, best_path = t, entry["path"]
+		self.Selected = best_path
+		self._sync_gizmo_to_selection()
+		kind = self._selected_kind() or "none"
+		if kind in ("light", "camera") and self._current_mode() == "scale":
+			self._status("Selected: {} ({}) — Scale N/A".format(best_path or "none", kind))
+		else:
+			self._status("Selected: {} ({})".format(best_path or "none", kind))
+		return best_path
+
+	def _distance_to_gizmo_center(self, u, v):
+		"""Closest-approach distance of the panel ray to the gizmo pivot, or None."""
+		gizmo = self.gizmo
+		if gizmo is None:
+			return None
+		origin, direction = self._ray_from_panel(u, v)
+		center = self.gm.object_world_position(gizmo)
+		to_c = self.gm.v_sub(center, origin)
+		t = self.gm.v_dot(to_c, direction)
+		if t < 0:
+			return None
+		closest = self.gm.v_add(origin, self.gm.v_scale(direction, t))
+		return self.gm.v_length(self.gm.v_sub(closest, center))
+
+	def _ray_near_gizmo(self, u, v, radius_scale=1.25):
+		"""True if the panel ray passes near the gizmo pivot (handle near-miss zone)."""
+		gizmo = self.gizmo
+		if gizmo is None:
+			return False
+		dist = self._distance_to_gizmo_center(u, v)
+		if dist is None:
+			return False
+		scale = max(self.rig.gizmo_uniform_scale(gizmo), 1e-4)
+		return dist <= self.rig.RING_RADIUS * scale * radius_scale
+
+	def _near_center(self, u, v):
+		"""True if the ray passes through the small gap around the pivot (pre-rod)."""
+		gizmo = self.gizmo
+		if gizmo is None:
+			return False
+		dist = self._distance_to_gizmo_center(u, v)
+		if dist is None:
+			return False
+		scale = max(self.rig.gizmo_uniform_scale(gizmo), 1e-4)
+		return dist <= self.rig.ROD_INNER * scale * 1.4
+
+	def _sync_gizmo_to_selection(self):
+		gizmo = self.gizmo
+		if gizmo is None:
+			return
+		self.Hovered = None
+		sel = op(self.Selected) if self.Selected else None
+		if sel is None:
+			self.rig.set_gizmo_mode(gizmo, None)
+			self._refresh_gizmo_feedback()
+			return
+		gizmo.par.tx, gizmo.par.ty, gizmo.par.tz = sel.par.tx.eval(), sel.par.ty.eval(), sel.par.tz.eval()
+		gizmo.par.rx, gizmo.par.ry, gizmo.par.rz = sel.par.rx.eval(), sel.par.ry.eval(), sel.par.rz.eval()
+		if self._current_mode() == "select":
+			self.rig.set_gizmo_mode(gizmo, None)
+		else:
+			self.rig.set_gizmo_mode(gizmo, self._effective_mode())
+		self._rescale_gizmo()
+		self._refresh_gizmo_feedback()
+		# Keep icon stuck to the selected light/camera.
+		kind = self._selected_kind()
+		if kind in ("light", "camera"):
+			proxy = self.icons.find_proxy_for(self.proxies, self.Selected)
+			self.icons.sync_proxy_transform(proxy, sel)
+
+	def OnModeChange(self):
+		mode = self._current_mode()
+		tb = self.toolbar_mod
+		if tb is not None:
+			tb.refresh_mode_highlight(self.toolbar, mode)
+		gizmo = self.gizmo
+		if gizmo is not None and self.Selected is not None:
+			eff = self._effective_mode()
+			if mode == "scale" and self._selected_kind() in ("light", "camera"):
+				self._status("Scale N/A for light/camera")
+			elif mode == "select":
+				self.rig.set_gizmo_mode(gizmo, None)
+			else:
+				self.rig.set_gizmo_mode(gizmo, eff)
+			self._refresh_gizmo_feedback()
+		elif gizmo is not None and mode == "select":
+			self.rig.set_gizmo_mode(gizmo, None)
+			self._refresh_gizmo_feedback()
+
+	def SetMode(self, mode):
+		"""Set gizmo Mode from the toolbar (or script)."""
+		if mode not in ("select", "translate", "scale", "rotate"):
+			return
+		try:
+			self.ownerComp.par.Mode = mode
+		except Exception as e:
+			self._status("SetMode fail: " + str(e)[:60])
+			return
+		# Parexec may not fire when set from script in some builds — sync directly.
+		self.OnModeChange()
+		self._status("Mode: " + mode)
+
+	def OnToolbarButton(self, button_name):
+		"""Dispatch a toolbar Button COMP click by node name."""
+		tb = self.toolbar_mod
+		if tb is not None and button_name in tb.MODE_BY_BUTTON:
+			self.SetMode(tb.MODE_BY_BUTTON[button_name])
+			return
+		if button_name == "btn_discover":
+			self.Discover()
+			return
+		if button_name == "btn_resetview":
+			self.ResetView()
+
+	GIZMO_DESIRED_PX = 90.0
+
+	def _rescale_gizmo(self):
+		gizmo, cam = self.gizmo, self.cam
+		if gizmo is None or cam is None:
+			return
+		cam_pos = self.gm.object_world_position(cam)
+		gizmo_pos = self.gm.object_world_position(gizmo)
+		try:
+			fov_y = float(cam.par.fov.eval())
+		except Exception:
+			fov_y = 45.0
+		scale = self.gm.gizmo_screen_scale(cam_pos, gizmo_pos, fov_y, self._render_res_h(), self.GIZMO_DESIRED_PX)
+		gizmo.par.sx = gizmo.par.sy = gizmo.par.sz = max(scale, 1e-4)
+
+	# ---- Hover highlight + guide lines ----
+	def UpdateHover(self, u, v):
+		"""Pick the hovered handle (or center zone) from rollu/rollv."""
+		if self.Drag is not None:
+			return
+		if self.gizmo is None or self.Selected is None or self._current_mode() == "select":
+			self._apply_hover(None)
+			return
+		handle_id = self._pick_handle(u, v)
+		if handle_id is None and self._near_center(u, v):
+			handle_id = CENTER_HOVER_ID
+		self._apply_hover(handle_id)
+
+	def _apply_hover(self, handle_id):
+		if handle_id == self.Hovered:
+			return
+		self.Hovered = handle_id
+		self._refresh_gizmo_feedback()
+
+	def _refresh_gizmo_feedback(self):
+		"""Resolve active highlight + guide lines from Drag (wins) or Hovered."""
+		gizmo = self.gizmo
+		if gizmo is None:
+			return
+		active = None
+		if self.Drag is not None:
+			active = self.Drag["handle"]["id"]
+		elif self.Hovered is not None:
+			active = self.Hovered
+
+		highlight_ids = set()
+		guide_axes = set()
+		mode = self._effective_mode()
+		if active == CENTER_HOVER_ID:
+			for handle in self.rig.HANDLES:
+				if mode in handle["modes"] and handle["kind"] == "axis":
+					highlight_ids.add(handle["id"])
+			guide_axes = {"x", "y", "z"}
+		elif active is not None and active in self.rig.HANDLES_BY_ID:
+			highlight_ids = {active}
+			guide_axes = self.rig.handle_axes_for_highlight(self.rig.HANDLES_BY_ID[active])
+
+		self.rig.set_gizmo_highlight(gizmo, highlight_ids)
+		self.rig.set_guide_lines(gizmo, guide_axes)
+
+	# ---- G4/G4b/G5 handle hit-test + drag ----
+	def _hit_test(self, origin, direction, geom):
+		gm = self.gm
+		if geom["kind"] == "axis":
+			dist = gm.ray_line_distance(origin, direction, geom["point"], geom["direction"])
+			scale = self.rig.gizmo_uniform_scale(self.gizmo)
+			if dist > max(self.rig.TUBE_RADIUS * scale, 1e-4):
+				return None
+			t_line = gm.closest_t_on_ray_to_line(origin, direction, geom["point"], geom["direction"])
+			# Keep rods from stealing center clicks meant for plane chips.
+			if t_line is None or not (geom["t_min"] * 0.85 <= t_line <= geom["t_max"] * 1.15):
+				return None
+			hit = gm.v_add(geom["point"], gm.v_scale(geom["direction"], t_line))
+			return gm.v_length(gm.v_sub(hit, origin))
+		if geom["kind"] == "plane":
+			hit = gm.ray_vs_plane(origin, direction, geom["point"], geom["normal"])
+			if hit is None:
+				return None
+			rel = gm.v_sub(hit, geom["point"])
+			da, db = gm.v_dot(rel, geom["a_dir"]), gm.v_dot(rel, geom["b_dir"])
+			if abs(da) > geom["half"] or abs(db) > geom["half"]:
+				return None
+			return gm.v_length(gm.v_sub(hit, origin))
+		hit = gm.ray_vs_disc(origin, direction, geom["center"], geom["normal"], geom["radius"], geom["tolerance"])
+		if hit is None:
+			return None
+		return gm.v_length(gm.v_sub(hit, origin))
+
+	def _pick_handle(self, u, v):
+		gizmo = self.gizmo
+		if gizmo is None or self.Selected is None:
+			return None
+		origin, direction = self._ray_from_panel(u, v)
+		mode = self._effective_mode()
+		best_id, best_t = None, None
+		for handle in self.rig.HANDLES:
+			if mode not in handle["modes"]:
+				continue
+			geom = self.rig.handle_world_geometry(gizmo, handle)
+			t = self._hit_test(origin, direction, geom)
+			if t is not None and (best_t is None or t < best_t):
+				best_t, best_id = t, handle["id"]
+		return best_id
+
+	def BeginDrag(self, u, v):
+		if self.Selected is None or self.gizmo is None:
+			return False
+		handle_id = self._pick_handle(u, v)
+		if handle_id is None:
+			return False
+		sel = op(self.Selected)
+		if sel is None:
+			return False
+		mode = self._effective_mode()
+		handle = self.rig.HANDLES_BY_ID[handle_id]
+		write_names = handle["write"].get(mode)
+		if not write_names:
+			return False
+		origin, direction = self._ray_from_panel(u, v)
+		geom = self.rig.handle_world_geometry(self.gizmo, handle)
+		drag = {"handle": handle, "mode": mode, "geom": geom}
+		if mode == "translate":
+			drag["start_values"] = {n: float(getattr(sel.par, n).eval()) for n in ("tx", "ty", "tz")}
+		elif mode == "scale":
+			drag["start_values"] = {n: float(getattr(sel.par, n).eval()) for n in write_names}
+		else:
+			drag["start_rotation"] = (
+				float(sel.par.rx.eval()), float(sel.par.ry.eval()), float(sel.par.rz.eval()),
+			)
+		if handle["kind"] == "axis":
+			drag["start_t"] = self.gm.closest_t_on_ray_to_line(origin, direction, geom["point"], geom["direction"])
+		elif handle["kind"] == "plane":
+			drag["start_hit"] = self.gm.ray_vs_plane(origin, direction, geom["point"], geom["normal"])
+		else:
+			hit = self.gm.ray_vs_plane(origin, direction, geom["center"], geom["normal"])
+			drag["start_dir"] = self.gm.v_sub(hit, geom["center"]) if hit else (1.0, 0.0, 0.0)
+		self.Drag = drag
+		self._status("Drag begin: " + handle_id)
+		self._refresh_gizmo_feedback()
+		return True
+
+	def _write_translate(self, sel, drag, world_delta):
+		start = drag["start_values"]
+		sel.par.tx = start["tx"] + world_delta[0]
+		sel.par.ty = start["ty"] + world_delta[1]
+		sel.par.tz = start["tz"] + world_delta[2]
+
+	def _apply_rotation(self, sel, drag, angle_delta_deg, world_normal):
+		gm = self.gm
+		rord = "xyz"
+		try:
+			rord = str(sel.par.rord.eval()).lower()
+		except Exception:
+			pass
+		if rord != "xyz":
+			self._status("Rotate: rord '{}' unsupported, xyz fallback".format(rord))
+		rx0, ry0, rz0 = drag["start_rotation"]
+		r_current = gm.mat3_from_euler_xyz(rx0, ry0, rz0)
+		r_delta = gm.mat3_from_axis_angle(world_normal, angle_delta_deg)
+		r_new = gm.mat3_mul(r_delta, r_current)
+		rx, ry, rz = gm.euler_xyz_from_mat3(r_new)
+		sel.par.rx, sel.par.ry, sel.par.rz = rx, ry, rz
+
+	def UpdateDrag(self, u, v):
+		drag = self.Drag
+		if drag is None:
+			return False
+		sel = op(self.Selected) if self.Selected else None
+		if sel is None:
+			self.Drag = None
+			return False
+		gm = self.gm
+		origin, direction = self._ray_from_panel(u, v)
+		handle, geom, mode = drag["handle"], drag["geom"], drag["mode"]
+		write_names = handle["write"][mode]
+
+		if handle["kind"] == "axis":
+			t_now = gm.closest_t_on_ray_to_line(origin, direction, geom["point"], geom["direction"])
+			if t_now is None or drag.get("start_t") is None:
+				return True
+			delta_scalar = t_now - drag["start_t"]
+			if mode == "translate":
+				self._write_translate(sel, drag, gm.v_scale(geom["direction"], delta_scalar))
+			else:
+				ref = max(self.rig.gizmo_uniform_scale(self.gizmo), 1e-4) * self.rig.ROD_LENGTH
+				name = write_names[0]
+				start = drag["start_values"][name]
+				setattr(sel.par, name, max(start * (1.0 + delta_scalar / ref), 1e-4))
+
+		elif handle["kind"] == "plane":
+			hit = gm.ray_vs_plane(origin, direction, geom["point"], geom["normal"])
+			if hit is None or drag.get("start_hit") is None:
+				return True
+			world_delta = gm.v_sub(hit, drag["start_hit"])
+			if mode == "translate":
+				self._write_translate(sel, drag, world_delta)
+			else:
+				ref = max(self.rig.gizmo_uniform_scale(self.gizmo), 1e-4) * self.rig.ROD_LENGTH
+				delta_a, delta_b = gm.v_dot(world_delta, geom["a_dir"]), gm.v_dot(world_delta, geom["b_dir"])
+				name_a, name_b = write_names
+				start_a, start_b = drag["start_values"][name_a], drag["start_values"][name_b]
+				setattr(sel.par, name_a, max(start_a * (1.0 + delta_a / ref), 1e-4))
+				setattr(sel.par, name_b, max(start_b * (1.0 + delta_b / ref), 1e-4))
+
+		else:  # disc / rotate
+			hit = gm.ray_vs_plane(origin, direction, geom["center"], geom["normal"])
+			if hit is None:
+				return True
+			cur_dir = gm.v_sub(hit, geom["center"])
+			angle = gm.signed_angle_in_plane(drag["start_dir"], cur_dir, geom["normal"])
+			self._apply_rotation(sel, drag, angle, geom["normal"])
+
+		# Keep the rig stuck to the object; drag hit math still uses BeginDrag geom.
+		self._sync_gizmo_to_selection()
+		return True
+
+	def EndDrag(self):
+		path = self.Selected
+		self.Drag = None
+		self._refresh_object_bounds(path)
+		self._sync_all_proxies()
+		self._sync_gizmo_to_selection()
+		self._status("Drag end")
+		# _sync clears Hovered; next rollover sample restores highlight.
+
+	# ---- Private edit camera: orbit / pan / dolly, seeded once ----
+	def _geo_bounds_centroid(self):
+		geos = [e for e in self.Objects if e.get("kind") == "geo"]
+		if not geos:
+			# Fall back to any discovered object (light/camera icons).
+			geos = self.Objects
+		if not geos:
+			return None
+		cx = cy = cz = 0.0
+		n = 0
+		for entry in geos:
+			mn, mx = entry["min"], entry["max"]
+			cx += 0.5 * (mn[0] + mx[0])
+			cy += 0.5 * (mn[1] + mx[1])
+			cz += 0.5 * (mn[2] + mx[2])
+			n += 1
+		if n < 1:
+			return None
+		return (cx / n, cy / n, cz / n)
+
+	def _scene_cam_lookat_pivot(self, scene_cam):
+		"""Best-effort look-at pivot from a scene camera; None if unavailable."""
+		try:
+			# lookat COMP path (common TD camera setup)
+			look = scene_cam.par.lookat.eval()
+			if look is not None:
+				return self.gm.object_world_position(look)
+		except Exception:
+			pass
+		try:
+			# Some builds expose pivot via px/py/pz when using pivot-style look
+			px = float(scene_cam.par.px.eval())
+			py = float(scene_cam.par.py.eval())
+			pz = float(scene_cam.par.pz.eval())
+			if abs(px) + abs(py) + abs(pz) > 1e-6:
+				# Pivot pars are often local; convert via worldTransform when possible.
+				try:
+					wp = scene_cam.worldTransform * tdu.Position(px, py, pz)
+					return (float(wp.x), float(wp.y), float(wp.z))
+				except Exception:
+					pos = self.gm.object_world_position(scene_cam)
+					return (pos[0] + px, pos[1] + py, pos[2] + pz)
+		except Exception:
+			pass
+		return None
+
+	def SeedCamera(self, scene_cam):
+		pos = self.gm.object_world_position(scene_cam)
+		_, _, fwd = self.gm.camera_basis(scene_cam)
+		pivot = self._scene_cam_lookat_pivot(scene_cam)
+		if pivot is None:
+			pivot = self._geo_bounds_centroid()
+		if pivot is None:
+			pivot = self.gm.v_add(pos, self.gm.v_scale(fwd, 5.0))
+		to_cam = self.gm.v_sub(pos, pivot)
+		dist = max(self.gm.v_length(to_cam), 0.1)
+		# If look-at was missing and we fell back to a centroid behind the cam,
+		# keep a forward pivot so the orbit frame stays usable.
+		if self.gm.v_dot(to_cam, fwd) < 0 and self._scene_cam_lookat_pivot(scene_cam) is None:
+			pivot = self.gm.v_add(pos, self.gm.v_scale(fwd, dist))
+			to_cam = self.gm.v_sub(pos, pivot)
+		yaw = math.degrees(math.atan2(to_cam[0], to_cam[2]))
+		pitch = math.degrees(math.asin(max(-1.0, min(1.0, to_cam[1] / dist))))
+		self.Orbit = {"yaw": yaw, "pitch": pitch, "dist": dist, "pivot": pivot}
+		self._apply_orbit_camera()
+		self.CamSeeded = True
+		self._status("Camera seeded from " + scene_cam.path)
+
+	def ResetView(self):
+		self.CamSeeded = False
+		self.Discover()
+
+	def _apply_orbit_camera(self):
+		cam = self.cam
+		if cam is None:
+			return
+		yaw, pitch = math.radians(self.Orbit["yaw"]), math.radians(self.Orbit["pitch"])
+		dist, pivot = self.Orbit["dist"], self.Orbit["pivot"]
+		offset = (math.cos(pitch) * math.sin(yaw), math.sin(pitch), math.cos(pitch) * math.cos(yaw))
+		cam.par.tx = pivot[0] + dist * offset[0]
+		cam.par.ty = pivot[1] + dist * offset[1]
+		cam.par.tz = pivot[2] + dist * offset[2]
+		cam.par.ry = math.degrees(yaw)
+		cam.par.rx = -math.degrees(pitch)
+		cam.par.rz = 0.0
+		self._mirror_orient_camera(offset)
+		self._rescale_gizmo()
+		self._refresh_camera_proxy_visibility()
+
+	def _mirror_orient_camera(self, offset=None):
+		"""Keep cam_orient orbiting the view-cube with the same yaw/pitch."""
+		cam_o = self.cam_orient
+		og = self.orient
+		if cam_o is None or og is None:
+			return
+		yaw, pitch = math.radians(self.Orbit["yaw"]), math.radians(self.Orbit["pitch"])
+		if offset is None:
+			offset = (
+				math.cos(pitch) * math.sin(yaw),
+				math.sin(pitch),
+				math.cos(pitch) * math.cos(yaw),
+			)
+		d = og.ORIENT_CAM_DIST
+		cam_o.par.tx = d * offset[0]
+		cam_o.par.ty = d * offset[1]
+		cam_o.par.tz = d * offset[2]
+		cam_o.par.ry = math.degrees(yaw)
+		cam_o.par.rx = -math.degrees(pitch)
+		cam_o.par.rz = 0.0
+
+	# ---- Orientation view-cube (ui_orient panel) ----
+	def _pick_orient_zone_uv(self, u, v):
+		"""Ray-pick an orient zone using u/v in the ui_orient panel (0..1)."""
+		og = self.orient
+		cam_o = self.cam_orient
+		if og is None or cam_o is None:
+			return None
+		res = float(og.CUBE_RENDER_RES)
+		origin, direction = self.gm.unproject_ray(cam_o, u, v, res, res)
+		best_id, best_t = None, None
+		for zone in og.ZONES:
+			t = self.gm.ray_vs_aabb(origin, direction, zone["aabb_min"], zone["aabb_max"])
+			if t is not None and (best_t is None or t < best_t):
+				best_t, best_id = t, zone["id"]
+		return best_id
+
+	def _apply_orient_hover(self, zone_id):
+		if zone_id == self.OrientHovered:
+			return
+		self.OrientHovered = zone_id
+		og = self.orient
+		if og is not None:
+			og.set_orient_highlight(self.orient_cube, zone_id)
+
+	def SnapView(self, direction):
+		"""Instant-snap edit camera yaw/pitch to look from `direction` (pivot/dist kept)."""
+		og = self.orient
+		if og is None:
+			return
+		yaw, pitch = og.direction_to_yaw_pitch(direction)
+		self.Orbit["yaw"] = yaw
+		self.Orbit["pitch"] = pitch
+		self._apply_orbit_camera()
+		self.Unlock()
+		self._status("Snap view")
+
+	def OnOrientPanelValueChange(self, panelValue):
+		"""Handle clicks/hover on the ui_orient view-cube panel."""
+		ui = self.ui_orient
+		if ui is None:
+			return
+		try:
+			u, v = float(ui.panel.u.val), float(ui.panel.v.val)
+			lsel = int(ui.panel.lselect.val)
+		except Exception:
+			return
+		rollover = 0
+		rollu = rollv = 0.0
+		try:
+			rollover = int(ui.panel.rollover.val)
+			rollu = float(ui.panel.rollu.val)
+			rollv = float(ui.panel.rollv.val)
+		except Exception:
+			pass
+
+		self.Unlock()
+		lsel_edge = bool(lsel) and not bool(getattr(self, "_orient_lsel_prev", 0))
+		if lsel and not lsel_edge:
+			# Armed sample (skip stale edge UV), same pattern as main panel LMB.
+			if not getattr(self, "_orient_lmb_armed", False):
+				self._orient_lmb_armed = True
+				zone_id = self._pick_orient_zone_uv(u, v)
+				zone = self.orient.ZONES_BY_ID.get(zone_id) if self.orient and zone_id else None
+				if zone is not None:
+					self.SnapView(zone["direction"])
+		elif not lsel:
+			self._orient_lmb_armed = False
+		self._orient_lsel_prev = lsel
+
+		if rollover:
+			self._apply_orient_hover(self._pick_orient_zone_uv(rollu, rollv))
+		else:
+			self._apply_orient_hover(None)
+		if not lsel:
+			self.Lock()
+
+	def _orbit_update(self, u, v):
+		if self._orbit_last is None:
+			self._orbit_last = (u, v)
+			return
+		du, dv = u - self._orbit_last[0], v - self._orbit_last[1]
+		self._orbit_last = (u, v)
+		self.Orbit["yaw"] += du * 220.0
+		# Grab / Blender turntable: drag up lowers camera elevation.
+		self.Orbit["pitch"] = max(-89.0, min(89.0, self.Orbit["pitch"] - dv * 220.0))
+		self._apply_orbit_camera()
+
+	def _pan_update(self, u, v):
+		if self._pan_last is None:
+			self._pan_last = (u, v)
+			return
+		du, dv = u - self._pan_last[0], v - self._pan_last[1]
+		self._pan_last = (u, v)
+		right, up, _ = self.gm.camera_basis(self.cam)
+		speed = self.Orbit["dist"] * 1.2
+		# Grab-pan: content follows the mouse.
+		pivot = self.gm.v_sub(self.Orbit["pivot"], self.gm.v_scale(right, du * speed))
+		pivot = self.gm.v_sub(pivot, self.gm.v_scale(up, dv * speed))
+		self.Orbit["pivot"] = pivot
+		self._apply_orbit_camera()
+
+	def _dolly(self, wheel):
+		self.Orbit["dist"] = max(0.25, self.Orbit["dist"] * (0.9 if wheel > 0 else 1.1))
+		self._apply_orbit_camera()
+
+	def _lmb_press(self, u, v):
+		"""Handle a single LMB press once UV is armed (not on the button edge)."""
+		if self._current_mode() != "select" and self.Selected is not None and self._pick_handle(u, v) is not None:
+			self.BeginDrag(u, v)
+			return
+		if self._current_mode() != "select" and self.Selected is not None and self._ray_near_gizmo(u, v):
+			# Near-miss on the rig: ignore so we don't clear selection.
+			self._status("Gizmo near-miss")
+			return
+		self.SelectAt(u, v)
+
+	# ---- Idle-cook control (verified mechanism: op.lock, not a script early-out) ----
+	_LOCK_NODES = (
+		"render_edit",
+		"render_gizmo",
+		"composite_edit",
+		"render_orient",
+	)
+
+	def Lock(self):
+		for name in self._LOCK_NODES:
+			node = self.ownerComp.op(name)
+			if node is not None:
+				node.lock = True
+
+	def Unlock(self):
+		for name in self._LOCK_NODES:
+			node = self.ownerComp.op(name)
+			if node is not None:
+				node.lock = False
+
+	def OpenPanel(self):
+		p = self.panel
+		if p is None:
+			return
+		try:
+			p.openViewer()
+		except Exception as e:
+			self._status("OpenPanel fail: " + str(e)[:60])
+
+	# ---- Panel Execute DAT entry point (fires only on value change — idle-cheap) ----
+	def OnPanelValueChange(self, panelValue):
+		p = self.panel
+		if p is None:
+			return
+		try:
+			u, v = float(p.panel.u.val), float(p.panel.v.val)
+			lsel, rsel, msel = int(p.panel.lselect.val), int(p.panel.rselect.val), int(p.panel.mselect.val)
+		except Exception:
+			return
+		wheel = 0.0
+		try:
+			wheel = float(p.panel.wheel.val)
+		except Exception:
+			pass
+
+		# Hover UV (rollu/rollv) updates without a button held; plain u/v do not.
+		rollover = 0
+		rollu = rollv = 0.0
+		try:
+			rollover = int(p.panel.rollover.val)
+			rollu = float(p.panel.rollu.val)
+			rollv = float(p.panel.rollv.val)
+		except Exception:
+			pass
+
+		active = bool(lsel or rsel or msel or wheel)
+		# Unlock for button interaction OR hover feedback updates.
+		if active or rollover:
+			self.Unlock()
+
+		lsel_edge = bool(lsel) and not bool(self._lsel_prev)
+		rsel_edge = bool(rsel) and not bool(self._rsel_prev)
+		msel_edge = bool(msel) and not bool(self._msel_prev)
+
+		# LMB: never pick on the button-down edge (u/v often still stale).
+		# First non-edge event while held arms + picks once; then drag.
+		if lsel:
+			if lsel_edge:
+				self._lmb_armed = False
+			if self.Drag is not None:
+				self.UpdateDrag(u, v)
+			elif not lsel_edge and not self._lmb_armed:
+				self._lmb_armed = True
+				self._lmb_press(u, v)
+		else:
+			if self.Drag is not None:
+				self.EndDrag()
+			self._lmb_armed = False
+		self._lsel_prev = lsel
+
+		# RMB orbit: skip edge; seed last UV on first follow-up sample (no delta).
+		if rsel:
+			if rsel_edge:
+				self._orbit_armed = False
+				self._orbit_last = None
+			elif not self._orbit_armed:
+				self._orbit_last = (u, v)
+				self._orbit_armed = True
+			else:
+				self._orbit_update(u, v)
+		else:
+			self._orbit_last = None
+			self._orbit_armed = False
+		self._rsel_prev = rsel
+
+		if msel:
+			if msel_edge:
+				self._pan_armed = False
+				self._pan_last = None
+			elif not self._pan_armed:
+				self._pan_last = (u, v)
+				self._pan_armed = True
+			else:
+				self._pan_update(u, v)
+		else:
+			self._pan_last = None
+			self._pan_armed = False
+		self._msel_prev = msel
+
+		if wheel:
+			self._dolly(wheel)
+
+		# Hover highlight / guide lines — skip while mid-drag (Drag owns feedback).
+		if not rollover:
+			self._apply_hover(None)
+		elif self.Drag is None:
+			self.UpdateHover(rollu, rollv)
+
+		# Re-lock when no button interaction (hover frame is frozen in the TOP).
+		if not active:
+			self.Lock()
