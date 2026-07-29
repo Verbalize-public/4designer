@@ -47,6 +47,8 @@ class FourdesignerExt:
 		self.ownerComp = ownerComp
 		# Pick table: {path, kind, min, max} — kind is geo | light | camera.
 		self.Objects = []
+		# O(1) path lookup; first Discover entry wins on duplicate paths.
+		self.ObjectsByPath = {}
 		# Ordered list of selected paths; last entry is the "primary" for
 		# Status/kind display when exactly one object is selected.
 		self.Selected = []
@@ -240,11 +242,17 @@ class FourdesignerExt:
 			return self._compute_world_bounds(obj)
 		return self._icon_world_bounds(obj)
 
-	def _object_entry(self, path):
+	def _rebuild_objects_by_path(self):
+		"""Index Objects by path; first entry wins (matches prior linear scan)."""
+		by_path = {}
 		for entry in self.Objects:
-			if entry["path"] == path:
-				return entry
-		return None
+			by_path.setdefault(entry["path"], entry)
+		self.ObjectsByPath = by_path
+
+	def _object_entry(self, path):
+		if path is None:
+			return None
+		return self.ObjectsByPath.get(path)
 
 	def _has_selection(self):
 		return bool(self.Selected)
@@ -279,6 +287,7 @@ class FourdesignerExt:
 		if rt is None:
 			self._status("Discover: no Rendertop set")
 			self.Objects = []
+			self.ObjectsByPath = {}
 			self._pick_cycle = None
 			self._rebuild_proxies([], [])
 			return []
@@ -304,6 +313,7 @@ class FourdesignerExt:
 			bmin, bmax = self._object_bounds(cam, "camera")
 			table.append({"path": cam.path, "kind": "camera", "min": bmin, "max": bmax})
 		self.Objects = table
+		self._rebuild_objects_by_path()
 		valid_paths = {e["path"] for e in table}
 		self.Selected = [p for p in self.Selected if p in valid_paths]
 		self._rebuild_proxies(lights, cams)
@@ -772,7 +782,7 @@ class FourdesignerExt:
 			self.rig.set_gizmo_mode(gizmo, None)
 		else:
 			self.rig.set_gizmo_mode(gizmo, self._effective_mode())
-		self._rescale_gizmo()
+		self._rescale_gizmo(feedback=False)
 		self._refresh_gizmo_feedback()
 		self._sync_selected_proxies()
 		self._sync_selection_overlay()
@@ -1203,7 +1213,7 @@ class FourdesignerExt:
 
 	GIZMO_DESIRED_PX = 90.0
 
-	def _rescale_gizmo(self):
+	def _rescale_gizmo(self, feedback=True):
 		gizmo, cam = self.gizmo, self.cam
 		if gizmo is None or cam is None:
 			return
@@ -1216,7 +1226,9 @@ class FourdesignerExt:
 		scale = self.gm.gizmo_screen_scale(cam_pos, gizmo_pos, fov_y, self._render_res_h(), self.GIZMO_DESIRED_PX)
 		gizmo.par.sx = gizmo.par.sy = gizmo.par.sz = max(scale, 1e-4)
 		# Snap grid cell spacing is in gizmo-local units — refresh when scale changes.
-		self._refresh_gizmo_feedback()
+		# Callers that refresh immediately after pass feedback=False to avoid a double cook.
+		if feedback:
+			self._refresh_gizmo_feedback()
 
 	# ---- Hover highlight + guide lines ----
 	def UpdateHover(self, u, v):
@@ -1400,25 +1412,40 @@ class FourdesignerExt:
 		parent_inv = t_entry["parent_world"].getInverse()
 		sel.setTransform(parent_inv * new_world)
 
-	def _update_gizmo_during_multi_drag(self, mode, translate_delta):
-		"""Keep the multi-select gizmo under the cursor without re-deriving
-		its pose from (possibly stale, un-refreshed) per-object AABB centers.
-		Translate moves the rig by the same world delta as the objects;
-		rotate/scale act in place on each object so the rig pose is static."""
-		gizmo = self.gizmo
-		if gizmo is None or self.Drag is None:
-			return
-		if mode == "translate" and translate_delta is not None:
-			base = self.Drag.get("start_gizmo_pos")
-			if base is not None:
-				delta = self._snapped_world_delta(base, translate_delta)
-				gizmo.par.tx = base[0] + delta[0]
-				gizmo.par.ty = base[1] + delta[1]
-				gizmo.par.tz = base[2] + delta[2]
-		self._rescale_gizmo()
-		self._refresh_gizmo_feedback()
-		self._sync_selected_proxies()
-		self._sync_selection_overlay()
+	def _pose_gizmo_during_drag(self, mode, translate_delta):
+		"""Light mid-drag gizmo pose — no overlay/proxies/feedback/rescale.
+
+		Fail-open: any exception falls back to full `_sync_gizmo_to_selection`.
+		Local rotate tracks the primary object's world orientation; translate
+		uses the snapped world delta from BeginDrag's start_gizmo_pos.
+		"""
+		try:
+			gizmo = self.gizmo
+			if gizmo is None or self.Drag is None:
+				return
+			if mode == "translate" and translate_delta is not None:
+				base = self.Drag.get("start_gizmo_pos")
+				if base is not None:
+					delta = self._snapped_world_delta(base, translate_delta)
+					gizmo.par.tx = base[0] + delta[0]
+					gizmo.par.ty = base[1] + delta[1]
+					gizmo.par.tz = base[2] + delta[2]
+				return
+			# Local single-select rotate: axes must follow the object.
+			if (
+				mode == "rotate"
+				and self._coordspace() != "global"
+				and len(self.Selected) == 1
+			):
+				sel = op(self.Selected[0])
+				if sel is not None:
+					gizmo.setTransform(self.gm.object_world_pose_matrix(sel))
+			# Global rotate/scale, Local scale, multi rotate/scale: leave pose.
+		except Exception:
+			try:
+				self._sync_gizmo_to_selection()
+			except Exception:
+				pass
 
 	def UpdateDrag(self, u, v):
 		drag = self.Drag
@@ -1427,7 +1454,8 @@ class FourdesignerExt:
 		targets = drag.get("targets") or []
 		live = [(t, op(t["path"])) for t in targets]
 		if not live or any(sel is None for _, sel in live):
-			self.Drag = None
+			# Abort mid-drag — still run EndDrag cleanup so overlays/bounds recover.
+			self.EndDrag()
 			return False
 		gm = self.gm
 		origin, direction = self._ray_from_panel(u, v)
@@ -1480,11 +1508,8 @@ class FourdesignerExt:
 			for t_entry, sel in live:
 				self._apply_rotation(sel, t_entry, angle, geom["normal"])
 
-		# Keep the rig stuck to the selection; drag hit math still uses BeginDrag geom.
-		if len(self.Selected) > 1:
-			self._update_gizmo_during_multi_drag(mode, translate_delta)
-		else:
-			self._sync_gizmo_to_selection()
+		# Light pose only — overlay/proxies/feedback/rescale deferred to EndDrag.
+		self._pose_gizmo_during_drag(mode, translate_delta)
 		return True
 
 	def EndDrag(self):
@@ -1783,6 +1808,14 @@ class FourdesignerExt:
 			if node is not None and node.lock:
 				node.lock = False
 
+	def _any_render_locked(self):
+		"""True if any idle-lock Render TOP is locked (partial lock included)."""
+		for name in self._LOCK_NODES:
+			node = self.ownerComp.op(name)
+			if node is not None and node.lock:
+				return True
+		return False
+
 	def _gesture_active(self):
 		"""True while a drag/orbit/pan/pick arm is in progress (even if a sample mis-reads buttons)."""
 		return bool(
@@ -1916,8 +1949,11 @@ class FourdesignerExt:
 			pass
 
 		active = bool(lsel or rsel or msel or wheel)
-		# Unlock for button interaction OR hover feedback updates.
-		if active or rollover:
+		# Unlock for buttons always; hover only when a render is still locked
+		# (skip the Unlock walk on repeat rollover samples while unlocked).
+		if active:
+			self.Unlock()
+		elif rollover and not self._gesture_active() and self._any_render_locked():
 			self.Unlock()
 
 		lsel_edge = bool(lsel) and not bool(self._lsel_prev)

@@ -90,3 +90,9 @@ Moving an object in TouchDesigner usually means hunting parameters in a dialog w
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Docs
+
+| Doc | Purpose |
+|-----|---------|
+| [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Hot-path audit + offline bench how-to |

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fourdesigner"
+version = "2.5.0"
+description = "In-TD direct-manipulation editor for Render TOP scenes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[project.optional-dependencies]
+dev = [
+	"pytest>=8.0",
+	"pytest-benchmark>=4.0",
+]
+
+# Source under td/ is plain modules loaded by TouchDesigner Text DATs, not an
+# installable package. Offline tests put td/ on sys.path via pytest pythonpath.
+[tool.setuptools]
+packages = []
+
+[tool.pytest.ini_options]
+pythonpath = ["td"]
+testpaths = ["tests"]
+addopts = "-q"

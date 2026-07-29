@@ -32,7 +32,7 @@ def _module_dir() -> Path:
 	raise FileNotFoundError("Could not locate the 4designer td directory")
 
 
-TODAY = "2026-07-29"
+TODAY = "2026-07-30"
 
 
 def _td_dir() -> Path:
