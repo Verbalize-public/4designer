@@ -19,6 +19,7 @@ MODE_BUTTONS = (
 ACTION_BUTTONS = (
 	("btn_discover", "Reload", "Reload scene"),
 	("btn_resetview", "View", "Reset view"),
+	("btn_snapgrid", "Grid", "Snap to grid"),
 )
 
 MODE_BY_BUTTON = {name: mode for name, _lab, _tip, mode in MODE_BUTTONS}
@@ -31,18 +32,17 @@ STRIP_H = 36
 MARGIN = 6
 ACTION_GAP = 12
 FIELD_W = 200
-RIGHT_GAP = 4
 FACE_W = 88
 FACE_H = 56
 
 COLOR_IDLE = (0.16, 0.16, 0.18)
 COLOR_ACTIVE = (0.28, 0.48, 0.78)
 COLOR_ACTION = (0.20, 0.22, 0.16)
-COLOR_SNAP_ON = (0.32, 0.55, 0.38)
 COLOR_FIELD_BG = (0.12, 0.12, 0.14)
 COLOR_TEXT = (0.92, 0.92, 0.94)
 
 NONE_RENDER = "__none__"
+RENDER_GROUP = "grp_rendertop"
 
 _FONT = "C:/Windows/Fonts/segoeui.ttf"
 
@@ -155,12 +155,17 @@ def _place_right(widget, width, right_offset, y, height=BTN_H):
 		pass
 
 
-def _make_control(parent, name, label, tip, bg_rgb, x=None, y=None, width=BTN_W, right_offset=None):
-	"""Container face + Text TOP. Returns (container, face_top)."""
+def _make_control(parent, name, label, tip, bg_rgb, x=None, y=None, width=BTN_W, right_offset=None, face_parent=None):
+	"""Container face + Text TOP. Returns (container, face_top).
+
+	`face_parent` defaults to `parent`. For nested groups, put the face TOP on the
+	toolbar root (or group) so paths stay stable for highlight lookups.
+	"""
 	comp = parent.create(containerCOMP, name)
 	if comp.name != name:
 		comp.name = name
-	face = _make_face_top(parent, _face_name(name), label, bg_rgb)
+	fp = face_parent if face_parent is not None else parent
+	face = _make_face_top(fp, _face_name(name), label, bg_rgb)
 	comp.par.top = face.path
 	comp.par.topfill = "best"
 	try:
@@ -179,6 +184,44 @@ def _make_control(parent, name, label, tip, bg_rgb, x=None, y=None, width=BTN_W,
 		_place(comp, x, y, width)
 	_set_help(comp, tip)
 	return comp, face
+
+
+def _make_right_group(parent, name, width, right_offset, y, height=BTN_H):
+	"""Right-anchored strip that hosts flush sibling controls."""
+	grp = parent.create(containerCOMP, name)
+	if grp.name != name:
+		grp.name = name
+	grp.par.align = "none"
+	try:
+		br, bg, bb = COLOR_FIELD_BG
+		grp.par.bgcolorr, grp.par.bgcolorg, grp.par.bgcolorb = br, bg, bb
+		grp.par.bgalpha = 1.0
+	except Exception:
+		pass
+	try:
+		grp.par.reposition = "off"
+	except Exception:
+		pass
+	_place_right(grp, width, right_offset, y, height=height)
+	return grp
+
+
+def _rendertop_picker(toolbar_root):
+	if toolbar_root is None:
+		return None
+	picker = toolbar_root.op(RENDER_GROUP + "/btn_rendertop")
+	if picker is not None:
+		return picker
+	return toolbar_root.op("btn_rendertop")
+
+
+def _refresh_list_btn(toolbar_root):
+	if toolbar_root is None:
+		return None
+	btn = toolbar_root.op(RENDER_GROUP + "/btn_refreshrenders")
+	if btn is not None:
+		return btn
+	return toolbar_root.op("btn_refreshrenders")
 
 
 def build_toolbar(parent, name="ui_toolbar"):
@@ -216,18 +259,15 @@ def build_toolbar(parent, name="ui_toolbar"):
 	x += ACTION_GAP
 	for bname, label, tip in ACTION_BUTTONS:
 		width = 52 if bname == "btn_discover" else BTN_W
-		_make_control(root, bname, label, tip, COLOR_ACTION, x=x, y=y, width=width)
+		bg = COLOR_IDLE if bname == "btn_snapgrid" else COLOR_ACTION
+		_make_control(root, bname, label, tip, bg, x=x, y=y, width=width)
 		x += width + BTN_GAP
 
-	right = MARGIN
-	_make_control(
-		root, "btn_refreshrenders", "List", "Refresh render list", COLOR_ACTION,
-		y=y, width=BTN_W, right_offset=right,
-	)
-	right += BTN_W + RIGHT_GAP
+	group_w = FIELD_W + BTN_W
+	grp = _make_right_group(root, RENDER_GROUP, group_w, 0, y, height=BTN_H)
 
 	# Picker stays a Button COMP (variable text label, no icon needed).
-	picker = root.create(buttonCOMP, "btn_rendertop")
+	picker = grp.create(buttonCOMP, "btn_rendertop")
 	if picker.name != "btn_rendertop":
 		picker.name = "btn_rendertop"
 	picker.par.buttontype = "momentary"
@@ -237,18 +277,18 @@ def build_toolbar(parent, name="ui_toolbar"):
 	except Exception:
 		pass
 	picker.par.colorr, picker.par.colorg, picker.par.colorb = COLOR_FIELD_BG
-	_place_right(picker, FIELD_W, right, y)
+	_place(picker, 0, 0, FIELD_W)
 	_set_help(picker, "Render TOP")
-	right += FIELD_W + RIGHT_GAP
 
 	_make_control(
-		root, "btn_snapgrid", "Snap", "Snap to grid", COLOR_IDLE,
-		y=y, width=BTN_W, right_offset=right,
+		grp, "btn_refreshrenders", "List", "Refresh render list", COLOR_ACTION,
+		x=FIELD_W, y=0, width=BTN_W, face_parent=root,
 	)
 
 	refresh_mode_highlight(root, "translate")
 	refresh_snap_highlight(root, False)
 	sync_rendertop_field(root, NONE_RENDER, ["(none)"], [NONE_RENDER])
+	sync_toolbar_exec(parent, root)
 	return root
 
 
@@ -265,13 +305,13 @@ def refresh_snap_highlight(toolbar_root, enabled):
 	if toolbar_root is None:
 		return
 	face = toolbar_root.op(_face_name("btn_snapgrid"))
-	_tint_face(face, COLOR_SNAP_ON if enabled else COLOR_IDLE)
+	_tint_face(face, COLOR_ACTIVE if enabled else COLOR_IDLE)
 
 
 def sync_rendertop_field(toolbar_root, menu_value, labels, names=None):
 	if toolbar_root is None:
 		return
-	picker = toolbar_root.op("btn_rendertop")
+	picker = _rendertop_picker(toolbar_root)
 	if picker is None:
 		return
 	if names is None:
@@ -311,8 +351,25 @@ def toolbar_button_paths(toolbar_root):
 		comp = toolbar_root.op(bname)
 		if comp is not None:
 			paths.append(comp.path)
-	for bname in ("btn_snapgrid", "btn_rendertop", "btn_refreshrenders"):
-		comp = toolbar_root.op(bname)
-		if comp is not None:
-			paths.append(comp.path)
+	picker = _rendertop_picker(toolbar_root)
+	if picker is not None:
+		paths.append(picker.path)
+	refresh = _refresh_list_btn(toolbar_root)
+	if refresh is not None:
+		paths.append(refresh.path)
 	return paths
+
+
+def sync_toolbar_exec(owner_comp, toolbar_root=None):
+	"""Keep toolbar_exec watching every clickable toolbar control."""
+	if owner_comp is None:
+		return
+	texec = owner_comp.op("toolbar_exec")
+	if texec is None:
+		return
+	toolbar_root = toolbar_root or owner_comp.op("ui_toolbar")
+	if toolbar_root is None:
+		return
+	paths = toolbar_button_paths(toolbar_root)
+	if paths:
+		texec.par.panels = " ".join(paths)

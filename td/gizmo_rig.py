@@ -34,6 +34,13 @@ PLANE_SIZE = 0.28
 GUIDE_HALF_LENGTH = 2000.0
 GUIDE_RADIUS = 0.025
 
+# Snap-plane grid: unit cell in local space; set_plane_grid scales the COMP so
+# one local cell maps to the world snap step (after gizmo screen-constant scale).
+GRID_HALF_CELLS = 20
+GRID_CELL_LOCAL = 1.0
+GRID_LINE_RADIUS = 0.02
+GRID_LINE_HALF = GRID_HALF_CELLS * GRID_CELL_LOCAL
+
 # (plane name) -> (axis a, axis b, plane normal axis)
 _PLANE_DEFS = {"xy": ("x", "y", "z"), "yz": ("y", "z", "x"), "zx": ("z", "x", "y")}
 
@@ -192,6 +199,64 @@ def _ensure_guide_mat(gizmo, axis_letter):
 	return mat
 
 
+def _ensure_grid_mat(gizmo, plane_name):
+	"""Dim axis-tinted material for the snap plane grid (normal-axis color)."""
+	name = "mat_grid_" + plane_name
+	mat = gizmo.op(name)
+	if mat is None:
+		mat = gizmo.create(constantMAT, name)
+	_a, _b, n = _PLANE_DEFS[plane_name]
+	r, g, b = AXIS_COLOR[n]
+	# Dim so the grid reads as overlay, not solid rods.
+	mat.par.colorr, mat.par.colorg, mat.par.colorb = r * 0.55, g * 0.55, b * 0.55
+	try:
+		mat.par.alpha = 0.55
+	except Exception:
+		pass
+	return mat
+
+
+def _tube_along(child, name, orient_axis, length, center):
+	"""Thin tubeSOP along orient_axis, centered at `center` dict {x,y,z}."""
+	tube = child.create(tubeSOP, name)
+	tube.par.rad1 = tube.par.rad2 = GRID_LINE_RADIUS
+	tube.par.height = length
+	tube.par.orient = orient_axis
+	tube.par.tx, tube.par.ty, tube.par.tz = center["x"], center["y"], center["z"]
+	tube.display = tube.render = False
+	return tube
+
+
+def _build_plane_grid_geo(child, plane_name):
+	"""Polygon grid of thin tubes on a unit-cell lattice in the named plane.
+
+	Coverage is ±GRID_HALF_CELLS cells of size GRID_CELL_LOCAL. `set_plane_grid`
+	scales the Geometry COMP so one local cell equals the world snap step.
+	"""
+	a, b, _n = _PLANE_DEFS[plane_name]
+	merge = child.create(mergeSOP, "merge1")
+	idx = 0
+	span = GRID_LINE_HALF * 2.0
+	# Lines parallel to axis a (vary along b).
+	for i in range(-GRID_HALF_CELLS, GRID_HALF_CELLS + 1):
+		center = {"x": 0.0, "y": 0.0, "z": 0.0}
+		center[b] = i * GRID_CELL_LOCAL
+		tube = _tube_along(child, "a" + str(i + GRID_HALF_CELLS), a, span, center)
+		merge.inputConnectors[idx].connect(tube)
+		idx += 1
+	# Lines parallel to axis b (vary along a).
+	for i in range(-GRID_HALF_CELLS, GRID_HALF_CELLS + 1):
+		center = {"x": 0.0, "y": 0.0, "z": 0.0}
+		center[a] = i * GRID_CELL_LOCAL
+		tube = _tube_along(child, "b" + str(i + GRID_HALF_CELLS), b, span, center)
+		merge.inputConnectors[idx].connect(tube)
+		idx += 1
+	out = child.create(outSOP, "out1")
+	out.inputConnectors[0].connect(merge)
+	merge.display = merge.render = False
+	out.display = out.render = True
+
+
 def build_gizmo_rig(parent, name="gizmo1"):
 	"""Create (or replace) the pivot Null COMP + per-axis handle Geometry children.
 
@@ -230,8 +295,21 @@ def build_gizmo_rig(parent, name="gizmo1"):
 		child.pickable = False
 		child.render = False
 
+	for i, pname in enumerate(("xy", "yz", "zx")):
+		child = gizmo.create(geometryCOMP, "grid_" + pname)
+		child.nodeX = (i % 3) * 160
+		child.nodeY = -800
+		for default_child in list(child.children):
+			default_child.destroy()
+		_build_plane_grid_geo(child, pname)
+		mat = _ensure_grid_mat(gizmo, pname)
+		child.par.material = mat.path
+		child.pickable = False
+		child.render = False
+
 	set_gizmo_mode(gizmo, "translate")
 	set_guide_lines(gizmo, ())
+	set_plane_grid(gizmo, None, False, (0.1, 0.1, 0.1), 1.0)
 	return gizmo
 
 
@@ -261,6 +339,62 @@ def set_guide_lines(gizmo, axes):
 		child = gizmo.op("guide_" + ax)
 		if child is not None:
 			child.render = ax in wanted
+
+
+def _plane_name_from_handle_id(plane_id):
+	"""'plane_xy' → 'xy'; bare 'xy' also accepted."""
+	if not plane_id:
+		return None
+	if plane_id.startswith("plane_"):
+		return plane_id[6:]
+	if plane_id in _PLANE_DEFS:
+		return plane_id
+	return None
+
+
+def set_plane_grid(gizmo, plane_id, visible, steps, gizmo_scale):
+	"""Show snap grid on one translate plane; hide others.
+
+	`steps` is (sx, sy, sz) world snap sizes. `gizmo_scale` is the gizmo's
+	uniform screen-constant scale so tube spacing maps to world steps.
+	Tubes are re-spaced in-place (no COMP scale) so line thickness stays readable.
+	"""
+	wanted = _plane_name_from_handle_id(plane_id) if visible else None
+	scale = max(float(gizmo_scale) if gizmo_scale else 1.0, 1e-4)
+	sx, sy, sz = steps if steps is not None else (0.1, 0.1, 0.1)
+	step_by_axis = {"x": float(sx), "y": float(sy), "z": float(sz)}
+	for pname, (a, b, _n) in _PLANE_DEFS.items():
+		child = gizmo.op("grid_" + pname)
+		if child is None:
+			continue
+		show = wanted == pname
+		child.render = show
+		if not show:
+			continue
+		# Keep COMP scale identity — spacing is written onto tube SOPs directly.
+		child.par.sx = child.par.sy = child.par.sz = 1.0
+		local_a = max(step_by_axis[a], 1e-6) / scale
+		local_b = max(step_by_axis[b], 1e-6) / scale
+		span_a = GRID_HALF_CELLS * local_a * 2.0
+		span_b = GRID_HALF_CELLS * local_b * 2.0
+		# Lines parallel to axis a (vary along b).
+		for i in range(-GRID_HALF_CELLS, GRID_HALF_CELLS + 1):
+			tube = child.op("a" + str(i + GRID_HALF_CELLS))
+			if tube is None:
+				continue
+			tube.par.height = span_a
+			center = {"x": 0.0, "y": 0.0, "z": 0.0}
+			center[b] = i * local_b
+			tube.par.tx, tube.par.ty, tube.par.tz = center["x"], center["y"], center["z"]
+		# Lines parallel to axis b (vary along a).
+		for i in range(-GRID_HALF_CELLS, GRID_HALF_CELLS + 1):
+			tube = child.op("b" + str(i + GRID_HALF_CELLS))
+			if tube is None:
+				continue
+			tube.par.height = span_b
+			center = {"x": 0.0, "y": 0.0, "z": 0.0}
+			center[a] = i * local_a
+			tube.par.tx, tube.par.ty, tube.par.tz = center["x"], center["y"], center["z"]
 
 
 def handle_axes_for_highlight(handle):

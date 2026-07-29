@@ -287,6 +287,7 @@ class FourdesignerExt:
 		self._status(
 			"Discover: {} geo / {} light / {} cam".format(len(geos), len(lights), len(cams))
 		)
+		self._sync_toolbar_exec()
 		return table
 
 	def _rebuild_proxies(self, lights, cams):
@@ -326,8 +327,16 @@ class FourdesignerExt:
 				icons.sync_proxy_transform(proxy, target)
 		self._refresh_camera_proxy_visibility()
 
+	@staticmethod
+	def _is_gizmo_geo_name(name):
+		return (
+			name.startswith("handle_")
+			or name.startswith("guide_")
+			or name.startswith("grid_")
+		)
+
 	def _gizmo_geometry_paths(self):
-		"""Explicit paths for the gizmo pass — nested handle/guide Geometry
+		"""Explicit paths for the gizmo pass — nested handle/guide/grid Geometry
 		COMPs must be listed individually; parent nullCOMP path alone is not
 		enough and must NOT be included (Render TOP geometry rejects it)."""
 		gizmo = self.gizmo
@@ -337,7 +346,7 @@ class FourdesignerExt:
 		for child in gizmo.children:
 			try:
 				if child.family == "COMP" and child.OPType == "geometryCOMP" and (
-					child.name.startswith("handle_") or child.name.startswith("guide_")
+					self._is_gizmo_geo_name(child.name)
 				):
 					paths.append(child.path)
 			except Exception:
@@ -362,7 +371,7 @@ class FourdesignerExt:
 		prev = {}
 		for child in gizmo.children:
 			try:
-				if child.name.startswith("handle_") or child.name.startswith("guide_"):
+				if self._is_gizmo_geo_name(child.name):
 					prev[child.path] = bool(child.render)
 					child.render = True
 			except Exception:
@@ -623,12 +632,23 @@ class FourdesignerExt:
 		self._status("Mode: " + mode)
 
 	def OnSnapGridChange(self):
-		"""Sync snap toggle highlight when Snapgrid par changes."""
+		"""Sync snap toggle highlight + plane grid when Snapgrid par changes."""
 		enabled = self._snap_enabled()
 		tb = self.toolbar_mod
 		if tb is not None:
 			tb.refresh_snap_highlight(self.toolbar, enabled)
+		self._refresh_gizmo_feedback()
 		self._status("Snap: " + ("on" if enabled else "off"))
+
+	def _sync_toolbar_exec(self):
+		"""Ensure toolbar_exec watches every clickable toolbar control."""
+		tb = self.toolbar_mod
+		if tb is None:
+			return
+		try:
+			tb.sync_toolbar_exec(self.ownerComp, self.toolbar)
+		except Exception:
+			pass
 
 	def OnToolbarButton(self, button_name):
 		"""Dispatch a toolbar Button COMP click by node name."""
@@ -971,6 +991,8 @@ class FourdesignerExt:
 			fov_y = 45.0
 		scale = self.gm.gizmo_screen_scale(cam_pos, gizmo_pos, fov_y, self._render_res_h(), self.GIZMO_DESIRED_PX)
 		gizmo.par.sx = gizmo.par.sy = gizmo.par.sz = max(scale, 1e-4)
+		# Snap grid cell spacing is in gizmo-local units — refresh when scale changes.
+		self._refresh_gizmo_feedback()
 
 	# ---- Hover highlight + guide lines ----
 	def UpdateHover(self, u, v):
@@ -992,7 +1014,7 @@ class FourdesignerExt:
 		self._refresh_gizmo_feedback()
 
 	def _refresh_gizmo_feedback(self):
-		"""Resolve active highlight + guide lines from Drag (wins) or Hovered."""
+		"""Resolve active highlight + guide lines + snap plane grid from Drag/Hovered."""
 		gizmo = self.gizmo
 		if gizmo is None:
 			return
@@ -1016,6 +1038,20 @@ class FourdesignerExt:
 
 		self.rig.set_gizmo_highlight(gizmo, highlight_ids)
 		self.rig.set_guide_lines(gizmo, guide_axes)
+
+		plane_grid_id = None
+		if self._snap_enabled() and mode == "translate":
+			if active is not None and active in self.rig.HANDLES_BY_ID:
+				h = self.rig.HANDLES_BY_ID[active]
+				if h["kind"] == "plane":
+					plane_grid_id = h["id"]
+		self.rig.set_plane_grid(
+			gizmo,
+			plane_grid_id,
+			plane_grid_id is not None,
+			self._snap_steps(),
+			self.rig.gizmo_uniform_scale(gizmo),
+		)
 
 	# ---- G4/G4b/G5 handle hit-test + drag ----
 	def _hit_test(self, origin, direction, geom):
@@ -1489,6 +1525,7 @@ class FourdesignerExt:
 		try:
 			# Keep the picker / snap tint current when the panel opens.
 			self.RefreshRenderTopList()
+			self._sync_toolbar_exec()
 			tb = self.toolbar_mod
 			if tb is not None:
 				tb.refresh_snap_highlight(self.toolbar, self._snap_enabled())

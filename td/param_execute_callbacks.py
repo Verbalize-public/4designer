@@ -11,6 +11,9 @@ def onValueChange(par, prev):
 		ext.OnModeChange()
 	elif par.name == "Snapgrid":
 		ext.OnSnapGridChange()
+	elif par.name in ("Snapgridx", "Snapgridy", "Snapgridz"):
+		# Respace the visible snap plane grid without toggling the highlight.
+		ext._refresh_gizmo_feedback()
 
 
 def onPulse(par):

@@ -338,8 +338,7 @@ def build_fourdesigner_op(parent=None, name: str = "fourdesigner1"):
 
 	texec = comp.op("toolbar_exec") or comp.create(panelexecuteDAT, "toolbar_exec")
 	texec.nodeX, texec.nodeY = 300, -300
-	btn_paths = toolbar_mod.toolbar_button_paths(toolbar)
-	texec.par.panels = " ".join(btn_paths)
+	toolbar_mod.sync_toolbar_exec(comp, toolbar)
 	# Containers use lselect; the Render TOP picker Button COMP uses select.
 	texec.par.panelvalue = "select lselect"
 	texec.par.valuechange = True
@@ -360,6 +359,7 @@ def build_fourdesigner_op(parent=None, name: str = "fourdesigner1"):
 	parexec.par.op = ".."
 	parexec.par.pars = (
 		"Rendertop Rendertopchoice Refreshrenders Mode Snapgrid "
+		"Snapgridx Snapgridy Snapgridz "
 		"Discover Resetview Openpanel"
 	)
 	parexec.par.valuechange = True
@@ -372,8 +372,8 @@ def build_fourdesigner_op(parent=None, name: str = "fourdesigner1"):
 	doc.text = (
 		"4designer\n"
 		"Set Rendertop (toolbar picker or parameter) -> pulse Open Panel.\n"
-		"Toolbar: Select | Move | Rotate | Scale + Reload / Reset View.\n"
-		"Right cluster: Snap toggle + Render TOP menu + refresh list.\n"
+		"Toolbar left: Select | Move | Rotate | Scale + Reload / View / Grid.\n"
+		"Toolbar right: Render TOP picker + List (grouped).\n"
 		"Orient cube bottom-right. Self-contained -- no Render Pick DAT.\n"
 		"See README.md.\n"
 	)

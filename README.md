@@ -21,9 +21,9 @@ Moving an object in TouchDesigner usually means hunting parameters in a dialog w
 - Select, translate, rotate, and scale any Geometry COMP referenced by your Render TOP (scale is geometry-only)
 - Ctrl+click to multi-select — the gizmo sits at the selection's center and a drag transforms every selected object at once
 - Pickable proxy icons mark lights and cameras (bulb / cone / distant arrow / camera frustum) for translate and rotate
-- In-viewer icon toolbar — Select / Move / Rotate / Scale, Reload, Reset View, plus a right-aligned Render TOP picker and snap toggle
+- In-viewer icon toolbar — Select / Move / Rotate / Scale, Reload, Reset View, Grid (snap) on the left; Render TOP picker + List grouped on the right
 - Choose the target Render TOP from the toolbar combobox (scans the parent network); refresh the list from the toolbar or parameters
-- Snap-to-grid for translate — per-axis step from parameters
+- Snap-to-grid for translate — per-axis step from parameters; highlighted translate planes show a snap grid when snap is on
 - Orientation view-cube in the bottom-right corner — click a face, edge, or corner to snap the edit camera
 - Private edit camera — orbit (RMB), pan (MMB), dolly (wheel) without touching your scene camera
 - Hover highlighting and per-axis guide lines while dragging
@@ -39,8 +39,8 @@ Moving an object in TouchDesigner usually means hunting parameters in a dialog w
 
 | Input | Action |
 |-------|--------|
-| Toolbar (left) | Switch mode (Select / Move / Rotate / Scale), Reload (Discover), Reset View |
-| Toolbar (right) | Snap toggle, Render TOP combobox, refresh render list |
+| Toolbar (left) | Switch mode (Select / Move / Rotate / Scale), Reload (Discover), Reset View, Grid (snap toggle) |
+| Toolbar (right) | Render TOP combobox + List (refresh) — flush grouped strip |
 | Orient cube (bottom-right) | Click a face / edge / corner to snap the edit camera |
 | LMB click | Select an object (replaces selection), or pick a gizmo handle |
 | Ctrl + LMB click | Toggle an object into/out of the selection |
@@ -69,7 +69,7 @@ Moving an object in TouchDesigner usually means hunting parameters in a dialog w
 - Translate and rotate respect Object-COMP parenting and all six TD Rotate Orders (`xyz`, `xzy`, `yxz`, `yzx`, `zxy`, `zyx`)
 - Scale applies to geometry only — lights and cameras use translate handles in Scale mode
 - Multi-select gizmo is world-aligned (no rotation) and only reflects position; scale/rotate still transform each object about its own origin, not the group center
-- Snap-to-grid applies to translate only (no rotate/scale snap); grid size is parameter-only for now
+- Snap-to-grid applies to translate only (no rotate/scale snap); when snap is on, a plane grid overlay appears on the highlighted translate plane (no global floor grid)
 - Render TOP picker lists Render TOPs in the parent network only
 - No world/local toggle
 - No light intensity/color or camera FOV editing — transform only
