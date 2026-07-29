@@ -3,7 +3,7 @@
 Direct-manipulation 3D editing for a TouchDesigner Render TOP — select, move, and rotate scene objects with on-screen gizmos, right inside the network.
 
 <p>
-  <img src="https://img.shields.io/badge/version-2.4.0-f0a020?style=flat-square" alt="v2.4.0" />
+  <img src="https://img.shields.io/badge/version-2.5.0-f0a020?style=flat-square" alt="v2.5.0" />
   <img src="https://img.shields.io/badge/TouchDesigner-2025-f0a020?style=flat-square" alt="TouchDesigner 2025" />
   <img src="https://img.shields.io/badge/license-MIT-f2ebe3?style=flat-square" alt="MIT license" />
 </p>
@@ -20,12 +20,13 @@ Moving an object in TouchDesigner usually means hunting parameters in a dialog w
 
 - Select, translate, rotate, and scale any Geometry COMP referenced by your Render TOP (scale is geometry-only)
 - Selected objects show a yellow AABB outline (visible in Select mode; one cage per object with Ctrl multiselect)
+- Local / Global coordinate toggle — gizmo (and nested snap grid) follow the object's own axes or world X/Y/Z
 - Ctrl+click to multi-select — the gizmo sits at the selection's center and a drag transforms every selected object at once
 - Alt+click cycles through overlapping objects at the click (front→back); Alt+Ctrl+click adds the next overlap to the selection
 - Pickable proxy icons mark lights and cameras (bulb / cone / distant arrow / camera frustum) for translate and rotate
-- In-viewer icon toolbar — Select / Move / Rotate / Scale, Reload, Reset View, Grid (snap) on the left; Render TOP picker + List grouped on the right
+- In-viewer icon toolbar — Select / Move / Rotate / Scale, Reload, Reset View, Grid (snap), Local/Global on the left; Render TOP picker + List grouped on the right
 - Choose the target Render TOP from the toolbar combobox (scans the parent network); refresh the list from the toolbar or parameters
-- Snap-to-grid for translate — per-axis step from parameters; highlighted translate planes show a snap grid when snap is on
+- Snap-to-grid for translate — per-axis step from parameters; highlighted translate planes show a snap grid when snap is on (grid follows Local or Global axes)
 - Orientation view-cube in the bottom-right corner — click a face, edge, or corner to snap the edit camera
 - Private edit camera — orbit (RMB), pan (MMB), dolly (wheel) without touching your scene camera
 - Hover highlighting and per-axis guide lines while dragging
@@ -41,7 +42,7 @@ Moving an object in TouchDesigner usually means hunting parameters in a dialog w
 
 | Input | Action |
 |-------|--------|
-| Toolbar (left) | Switch mode (Select / Move / Rotate / Scale), Reload (Discover), Reset View, Grid (snap toggle) |
+| Toolbar (left) | Switch mode (Select / Move / Rotate / Scale), Reload (Discover), Reset View, Grid (snap toggle), Local/Global |
 | Toolbar (right) | Render TOP combobox + List (refresh) — flush grouped strip |
 | Orient cube (bottom-right) | Click a face / edge / corner to snap the edit camera |
 | LMB click | Select an object (replaces selection), or pick a gizmo handle |
@@ -61,6 +62,7 @@ Moving an object in TouchDesigner usually means hunting parameters in a dialog w
 | `Rendertopchoice` | Menu mirror of `Rendertop` for the toolbar combobox |
 | `Refreshrenders` | Re-scan the parent network for Render TOPs and refresh the combobox |
 | `Mode` | `select` \| `translate` \| `scale` \| `rotate` |
+| `Coordspace` | `local` \| `global` — gizmo / snap-grid orientation |
 | `Snapgrid` | Enable translate snap-to-grid |
 | `Snapgridx` / `Snapgridy` / `Snapgridz` | Per-axis grid step (default `0.1`) |
 | `Discover` | Re-scan the Render TOP and rebuild the pick table + proxy icons |
@@ -72,10 +74,9 @@ Moving an object in TouchDesigner usually means hunting parameters in a dialog w
 
 - Translate and rotate respect Object-COMP parenting and all six TD Rotate Orders (`xyz`, `xzy`, `yxz`, `yzx`, `zxy`, `zyx`)
 - Scale applies to geometry only — lights and cameras use translate handles in Scale mode
-- Multi-select gizmo is world-aligned (no rotation) and only reflects position; scale/rotate still transform each object about its own origin, not the group center
-- Snap-to-grid applies to translate only (no rotate/scale snap); when snap is on, a plane grid overlay appears on the highlighted translate plane (no global floor grid)
+- Multi-select gizmo sits at the AABB-center average; Local orients to the primary (last-selected) object, Global stays world-aligned; scale/rotate still transform each object about its own origin, not the group center
+- Snap-to-grid applies to translate only (no rotate/scale snap); when snap is on, a plane grid overlay appears on the highlighted translate plane (no global floor grid) and follows Local/Global
 - Render TOP picker lists Render TOPs in the parent network only
-- No world/local toggle
 - No light intensity/color or camera FOV editing — transform only
 
 ## License

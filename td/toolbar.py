@@ -27,6 +27,7 @@ BUTTON_BY_MODE = {mode: name for name, _lab, _tip, mode in MODE_BUTTONS}
 BTN_W = 44
 BTN_H = 28
 BTN_GAP = 4
+COORD_BTN_W = 56
 STRIP_H = 36
 MARGIN = 6
 ACTION_GAP = 12
@@ -243,6 +244,33 @@ def _make_snap_button(parent, x, y, width=BTN_W):
 	return btn
 
 
+def _make_coordspace_button(parent, x, y, width=COORD_BTN_W):
+	"""Momentary Button COMP for Local/Global coord space toggle."""
+	existing = parent.op("btn_coordspace")
+	if existing is not None:
+		existing.destroy()
+	old_face = parent.op(_face_name("btn_coordspace"))
+	if old_face is not None:
+		old_face.destroy()
+	btn = parent.create(buttonCOMP, "btn_coordspace")
+	if btn.name != "btn_coordspace":
+		btn.name = "btn_coordspace"
+	btn.par.buttontype = "momentary"
+	btn.par.label = "Local"
+	try:
+		btn.par.fontsize = 11
+	except Exception:
+		pass
+	btn.par.colorr, btn.par.colorg, btn.par.colorb = COLOR_IDLE
+	_place(btn, x, y, width)
+	try:
+		btn.par.layer = 20.0
+	except Exception:
+		pass
+	_set_help(btn, "Toggle Local/Global coordinates")
+	return btn
+
+
 def _rendertop_picker(toolbar_root):
 	if toolbar_root is None:
 		return None
@@ -286,6 +314,11 @@ def build_toolbar(parent, name="ui_toolbar"):
 	root.par.rightoffset = 0.0
 	root.par.layer = 5.0
 	root.par.display = True
+	# Empty strip chrome must not steal RMB orbit / MMB pan from the parent panel.
+	try:
+		root.par.clickthrough = True
+	except Exception:
+		pass
 
 	y = max((STRIP_H - BTN_H) // 2, 2)
 	x = MARGIN
@@ -300,6 +333,8 @@ def build_toolbar(parent, name="ui_toolbar"):
 		x += width + BTN_GAP
 
 	_make_snap_button(root, x, y, width=BTN_W)
+	x += BTN_W + BTN_GAP
+	_make_coordspace_button(root, x, y, width=COORD_BTN_W)
 
 	group_w = FIELD_W + BTN_W
 	grp = _make_right_group(root, RENDER_GROUP, group_w, 0, y, height=BTN_H)
@@ -325,6 +360,7 @@ def build_toolbar(parent, name="ui_toolbar"):
 
 	refresh_mode_highlight(root, "translate")
 	refresh_snap_highlight(root, False)
+	refresh_coordspace_highlight(root, False)
 	sync_rendertop_field(root, NONE_RENDER, ["(none)"], [NONE_RENDER])
 	sync_toolbar_exec(parent, root)
 	return root
@@ -352,6 +388,25 @@ def refresh_snap_highlight(toolbar_root, enabled):
 		pass
 	# Legacy container+face build.
 	face = toolbar_root.op(_face_name("btn_snapgrid"))
+	_tint_face(face, (r, g, b))
+
+
+def refresh_coordspace_highlight(toolbar_root, is_global):
+	if toolbar_root is None:
+		return
+	btn = toolbar_root.op("btn_coordspace")
+	if btn is None:
+		return
+	try:
+		btn.par.label = "Global" if is_global else "Local"
+	except Exception:
+		pass
+	r, g, b = COLOR_ACTIVE if is_global else COLOR_IDLE
+	try:
+		btn.par.colorr, btn.par.colorg, btn.par.colorb = r, g, b
+	except Exception:
+		pass
+	face = toolbar_root.op(_face_name("btn_coordspace"))
 	_tint_face(face, (r, g, b))
 
 
@@ -401,6 +456,9 @@ def toolbar_button_paths(toolbar_root):
 	snap = toolbar_root.op("btn_snapgrid")
 	if snap is not None:
 		paths.append(snap.path)
+	coord = toolbar_root.op("btn_coordspace")
+	if coord is not None:
+		paths.append(coord.path)
 	picker = _rendertop_picker(toolbar_root)
 	if picker is not None:
 		paths.append(picker.path)

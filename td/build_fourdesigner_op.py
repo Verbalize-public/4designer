@@ -146,6 +146,13 @@ def _ensure_pars(comp):
 	except Exception:
 		pass
 	comp.par.Mode = "translate"
+	page.appendMenu("Coordspace", label="Coord Space")
+	try:
+		comp.par.Coordspace.menuNames = ["local", "global"]
+		comp.par.Coordspace.menuLabels = ["Local", "Global"]
+	except Exception:
+		pass
+	comp.par.Coordspace = "local"
 	page.appendToggle("Snapgrid", label="Snap to Grid")
 	comp.par.Snapgrid = False
 	page.appendFloat("Snapgridx", label="Snap Grid X")
@@ -329,6 +336,21 @@ def build_fourdesigner_op(parent=None, name: str = "fourdesigner1"):
 	pexec.par.active = True
 	pexec.text = _read("panel_execute_callbacks.py")
 
+	# Separate hold poller: ONLY rselect/mselect, with whileOn. Do not put u/v
+	# here — whileOn treats non-zero continuous values as "on" and would cook
+	# every frame while the cursor is over the panel.
+	hold = comp.op("panel_hold_exec") or comp.create(panelexecuteDAT, "panel_hold_exec")
+	hold.nodeX, hold.nodeY = 300, -75
+	hold.par.panels = comp.path
+	hold.par.panelvalue = "rselect mselect"
+	hold.par.valuechange = True
+	hold.par.offtoon = False
+	hold.par.ontooff = False
+	hold.par.whileon = True
+	hold.par.whileoff = False
+	hold.par.active = True
+	hold.text = _read("panel_hold_callbacks.py")
+
 	oexec = comp.op("orient_exec") or comp.create(panelexecuteDAT, "orient_exec")
 	oexec.nodeX, oexec.nodeY = 300, -450
 	oexec.par.panels = ui_orient.path
@@ -366,7 +388,7 @@ def build_fourdesigner_op(parent=None, name: str = "fourdesigner1"):
 	parexec.par.op = ".."
 	parexec.par.pars = (
 		"Rendertop Rendertopchoice Refreshrenders Mode Snapgrid "
-		"Snapgridx Snapgridy Snapgridz "
+		"Snapgridx Snapgridy Snapgridz Coordspace "
 		"Discover Resetview Openpanel"
 	)
 	parexec.par.valuechange = True

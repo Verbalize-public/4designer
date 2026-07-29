@@ -172,6 +172,12 @@ class FourdesignerExt:
 		except Exception:
 			return "translate"
 
+	def _coordspace(self):
+		try:
+			return self.ownerComp.par.Coordspace.eval()
+		except Exception:
+			return "local"
+
 	# ---- G2 Discover ----
 	def _expand_render_par(self, par):
 		"""Resolve a Render TOP OP/list parameter into a list of OPs."""
@@ -306,6 +312,7 @@ class FourdesignerExt:
 			self.SeedCamera(cams[0])
 		self._pick_cycle = None
 		self._sync_gizmo_to_selection()
+		self._ensure_panel_uv_buttons()
 		self._status(
 			"Discover: {} geo / {} light / {} cam".format(len(geos), len(lights), len(cams))
 		)
@@ -662,59 +669,61 @@ class FourdesignerExt:
 
 	def _sync_selection_overlay(self):
 		"""Pose AABB cages + tint light/camera proxies for `self.Selected`."""
-		overlay = self.overlay
-		if overlay is None:
-			return
-		root = overlay.ensure_selection_root(self.ownerComp, "selection1")
-		selected = set(self.Selected)
-		# Refresh bounds for selected paths so cages track after transforms.
-		for path in self.Selected:
-			self._refresh_object_bounds(path)
-		entries = []
-		for path in self.Selected:
-			entry = self._object_entry(path)
-			if entry is None:
-				continue
-			entries.append({
-				"path": entry["path"],
-				"min": entry["min"],
-				"max": entry["max"],
-			})
-		prev_names = set()
-		for child in root.children:
-			try:
-				if child.name.startswith("sel_"):
-					prev_names.add(child.name)
-			except Exception:
-				pass
-		overlay.sync_selection_overlays(root, entries)
-		# Tint proxies: selected → highlight; others → default.
-		icons = self.icons
-		proxies = self.proxies
-		if proxies is not None:
-			for child in proxies.children:
+		try:
+			overlay = self.overlay
+			if overlay is None:
+				return
+			root = overlay.ensure_selection_root(self.ownerComp, "selection1")
+			selected = set(self.Selected)
+			# Refresh bounds for selected paths so cages track after transforms.
+			for path in self.Selected:
+				self._refresh_object_bounds(path)
+			entries = []
+			for path in self.Selected:
+				entry = self._object_entry(path)
+				if entry is None:
+					continue
+				entries.append({
+					"path": entry["path"],
+					"min": entry["min"],
+					"max": entry["max"],
+				})
+			prev_names = set()
+			for child in root.children:
 				try:
-					if not child.name.startswith("proxy_"):
-						continue
-					# Match via find: storage path isn't on the child; invert sanitize.
-					is_sel = False
-					for path in selected:
-						if icons.find_proxy_for(proxies, path) is child:
-							is_sel = True
-							break
-					overlay.set_proxy_selected(child, is_sel, icons_mod=icons)
+					if child.name.startswith("sel_"):
+						prev_names.add(child.name)
 				except Exception:
 					pass
-		# New cages need to be listed on render_gizmo.geometry.
-		new_names = set()
-		for child in root.children:
-			try:
-				if child.name.startswith("sel_"):
-					new_names.add(child.name)
-			except Exception:
-				pass
-		if new_names != prev_names:
-			self._wire_gizmo_render()
+			overlay.sync_selection_overlays(root, entries)
+			# Tint proxies: selected → highlight; others → default.
+			icons = self.icons
+			proxies = self.proxies
+			if proxies is not None:
+				for child in proxies.children:
+					try:
+						if not child.name.startswith("proxy_"):
+							continue
+						is_sel = False
+						for path in selected:
+							if icons.find_proxy_for(proxies, path) is child:
+								is_sel = True
+								break
+						overlay.set_proxy_selected(child, is_sel, icons_mod=icons)
+					except Exception:
+						pass
+			new_names = set()
+			for child in root.children:
+				try:
+					if child.name.startswith("sel_"):
+						new_names.add(child.name)
+				except Exception:
+					pass
+			if new_names != prev_names:
+				self._wire_gizmo_render()
+		except Exception as e:
+			# Never let overlay failures break pick/drag/orbit panel handling.
+			self._status("sel overlay: " + str(e)[:60])
 
 	def _sync_gizmo_to_selection(self):
 		gizmo = self.gizmo
@@ -726,6 +735,7 @@ class FourdesignerExt:
 			self._refresh_gizmo_feedback()
 			self._sync_selection_overlay()
 			return
+		coord_global = self._coordspace() == "global"
 		if len(self.Selected) == 1:
 			sel = op(self.Selected[0])
 			if sel is None:
@@ -733,18 +743,31 @@ class FourdesignerExt:
 				self._refresh_gizmo_feedback()
 				self._sync_selection_overlay()
 				return
-			# World pose, not local rx/ty/rz -- correct under any Object-COMP parent.
-			gizmo.setTransform(self.gm.object_world_pose_matrix(sel))
+			if coord_global:
+				pos = self.gm.object_world_position(sel)
+				gizmo.par.tx, gizmo.par.ty, gizmo.par.tz = pos
+				gizmo.par.rx = gizmo.par.ry = gizmo.par.rz = 0.0
+			else:
+				# World pose, not local rx/ty/rz -- correct under any Object-COMP parent.
+				gizmo.setTransform(self.gm.object_world_pose_matrix(sel))
 		else:
-			# Multi-select: world-aligned gizmo at the AABB-center average.
+			# Multi-select: gizmo at the AABB-center average; Local uses primary rotation.
 			centroid = self._selection_centroid()
 			if centroid is None:
 				self.rig.set_gizmo_mode(gizmo, None)
 				self._refresh_gizmo_feedback()
 				self._sync_selection_overlay()
 				return
-			gizmo.par.tx, gizmo.par.ty, gizmo.par.tz = centroid
-			gizmo.par.rx = gizmo.par.ry = gizmo.par.rz = 0.0
+			if coord_global:
+				gizmo.par.tx, gizmo.par.ty, gizmo.par.tz = centroid
+				gizmo.par.rx = gizmo.par.ry = gizmo.par.rz = 0.0
+			else:
+				primary = op(self._primary_path())
+				if primary is not None:
+					gizmo.setTransform(self.gm.object_world_pose_matrix(primary))
+				else:
+					gizmo.par.rx = gizmo.par.ry = gizmo.par.rz = 0.0
+				gizmo.par.tx, gizmo.par.ty, gizmo.par.tz = centroid
 		if self._current_mode() == "select":
 			self.rig.set_gizmo_mode(gizmo, None)
 		else:
@@ -794,6 +817,15 @@ class FourdesignerExt:
 			tb.refresh_snap_highlight(self.toolbar, enabled)
 		self._refresh_gizmo_feedback()
 		self._status("Snap: " + ("on" if enabled else "off"))
+
+	def OnCoordSpaceChange(self):
+		"""Sync Local/Global toolbar highlight and re-pose the gizmo."""
+		is_global = self._coordspace() == "global"
+		tb = self.toolbar_mod
+		if tb is not None:
+			tb.refresh_coordspace_highlight(self.toolbar, is_global)
+		self._sync_gizmo_to_selection()
+		self._status("Coord: " + ("global" if is_global else "local"))
 
 	def _sync_toolbar_exec(self):
 		"""Ensure toolbar_exec watches every clickable toolbar control."""
@@ -851,6 +883,25 @@ class FourdesignerExt:
 			except Exception:
 				pass
 			self.OnSnapGridChange()
+			return
+		if button_name == "btn_coordspace":
+			try:
+				frame = absTime.frame
+			except Exception:
+				frame = None
+			if frame is not None and getattr(self, "_coord_btn_frame", None) == frame:
+				return
+			self._coord_btn_frame = frame
+			try:
+				cur = self._coordspace()
+			except Exception:
+				cur = "local"
+			nxt = "global" if cur == "local" else "local"
+			try:
+				self.ownerComp.par.Coordspace = nxt
+			except Exception:
+				pass
+			self.OnCoordSpaceChange()
 			return
 
 	# ---- Render TOP picker (parent-network scan) ----
@@ -1516,10 +1567,13 @@ class FourdesignerExt:
 		self.CamSeeded = False
 		self.Discover()
 
-	def _apply_orbit_camera(self):
+	def _apply_orbit_camera(self, aux=True):
 		cam = self.cam
 		if cam is None:
 			return
+		# Keep renders cooking for the gesture; skip Unlock chatter on every tick.
+		if aux:
+			self.Unlock()
 		yaw, pitch = math.radians(self.Orbit["yaw"]), math.radians(self.Orbit["pitch"])
 		dist, pivot = self.Orbit["dist"], self.Orbit["pivot"]
 		offset = (math.cos(pitch) * math.sin(yaw), math.sin(pitch), math.cos(pitch) * math.cos(yaw))
@@ -1529,9 +1583,22 @@ class FourdesignerExt:
 		cam.par.ry = math.degrees(yaw)
 		cam.par.rx = -math.degrees(pitch)
 		cam.par.rz = 0.0
-		self._mirror_orient_camera(offset)
-		self._rescale_gizmo()
-		self._refresh_camera_proxy_visibility()
+		# Orient cube tracks every tick (cheap). Gizmo rescale / proxy scan are
+		# expensive — only on aux frames (press/release / discrete moves).
+		try:
+			self._mirror_orient_camera(offset)
+		except Exception:
+			pass
+		if not aux:
+			return
+		try:
+			self._rescale_gizmo()
+		except Exception:
+			pass
+		try:
+			self._refresh_camera_proxy_visibility()
+		except Exception:
+			pass
 
 	def _mirror_orient_camera(self, offset=None):
 		"""Keep cam_orient orbiting the view-cube with the same yaw/pitch."""
@@ -1627,33 +1694,52 @@ class FourdesignerExt:
 			self._apply_orient_hover(self._pick_orient_zone_uv(rollu, rollv))
 		else:
 			self._apply_orient_hover(None)
-		if not lsel:
+		# Never freeze the main view while the user is still orbiting/panning/dragging.
+		if not lsel and not self._main_panel_buttons_down() and not self._gesture_active():
 			self.Lock()
 
-	def _orbit_update(self, u, v):
+	def _main_panel_buttons_down(self):
+		"""True if the owner panel still has LMB/RMB/MMB held."""
+		p = self.ownerComp
+		if p is None:
+			return False
+		try:
+			return bool(
+				int(p.panel.lselect.val)
+				or int(p.panel.rselect.val)
+				or int(p.panel.mselect.val)
+			)
+		except Exception:
+			return False
+
+	def _orbit_update(self, u, v, aux=True):
 		if self._orbit_last is None:
 			self._orbit_last = (u, v)
 			return
 		du, dv = u - self._orbit_last[0], v - self._orbit_last[1]
 		self._orbit_last = (u, v)
+		if abs(du) < 1e-8 and abs(dv) < 1e-8:
+			return
 		self.Orbit["yaw"] += du * 220.0
 		# Grab / Blender turntable: drag up lowers camera elevation.
 		self.Orbit["pitch"] = max(-89.0, min(89.0, self.Orbit["pitch"] - dv * 220.0))
-		self._apply_orbit_camera()
+		self._apply_orbit_camera(aux=aux)
 
-	def _pan_update(self, u, v):
+	def _pan_update(self, u, v, aux=True):
 		if self._pan_last is None:
 			self._pan_last = (u, v)
 			return
 		du, dv = u - self._pan_last[0], v - self._pan_last[1]
 		self._pan_last = (u, v)
+		if abs(du) < 1e-8 and abs(dv) < 1e-8:
+			return
 		right, up, _ = self.gm.camera_basis(self.cam)
 		speed = self.Orbit["dist"] * 1.2
 		# Grab-pan: content follows the mouse.
 		pivot = self.gm.v_sub(self.Orbit["pivot"], self.gm.v_scale(right, du * speed))
 		pivot = self.gm.v_sub(pivot, self.gm.v_scale(up, dv * speed))
 		self.Orbit["pivot"] = pivot
-		self._apply_orbit_camera()
+		self._apply_orbit_camera(aux=aux)
 
 	def _dolly(self, wheel):
 		self.Orbit["dist"] = max(0.25, self.Orbit["dist"] * (0.9 if wheel > 0 else 1.1))
@@ -1675,10 +1761,13 @@ class FourdesignerExt:
 		self.SelectAt(u, v, additive=additive, cycle=cycle)
 
 	# ---- Idle-cook control (verified mechanism: op.lock, not a script early-out) ----
+	# Do NOT lock `composite_edit`: it is the Container's `par.top` (panel face).
+	# Locking the panel display TOP mid-gesture freezes UV tracking — RMB orbit
+	# starts, then stalls, and later right-clicks appear dead. Lock only the
+	# expensive render inputs; the unlocked composite keeps showing the last frame.
 	_LOCK_NODES = (
 		"render_edit",
 		"render_gizmo",
-		"composite_edit",
 		"render_orient",
 	)
 
@@ -1691,8 +1780,40 @@ class FourdesignerExt:
 	def Unlock(self):
 		for name in self._LOCK_NODES:
 			node = self.ownerComp.op(name)
-			if node is not None:
+			if node is not None and node.lock:
 				node.lock = False
+
+	def _gesture_active(self):
+		"""True while a drag/orbit/pan/pick arm is in progress (even if a sample mis-reads buttons)."""
+		return bool(
+			self.Drag is not None
+			or self._orbit_armed
+			or self._pan_armed
+			or self._lmb_armed
+		)
+
+	def _ensure_panel_uv_buttons(self):
+		"""RMB orbit / MMB pan need uvbuttonsright/middle or u/v never update while held."""
+		p = self.ownerComp
+		if p is None:
+			return
+		try:
+			p.par.uvbuttonsleft = True
+			p.par.uvbuttonsmiddle = True
+			p.par.uvbuttonsright = True
+			p.par.mousewheel = True
+		except Exception:
+			pass
+
+	def _set_mouse_relative(self, enabled):
+		"""Relative UV while orbit/pan — u/v track drag; trueu/truev stay absolute for picks."""
+		p = self.ownerComp
+		if p is None:
+			return
+		try:
+			p.par.mouserel = bool(enabled)
+		except Exception:
+			pass
 
 	def OpenPanel(self):
 		p = self.panel
@@ -1700,17 +1821,65 @@ class FourdesignerExt:
 			return
 		try:
 			# Keep the picker / snap tint current when the panel opens.
+			self._ensure_panel_uv_buttons()
 			self.RefreshRenderTopList()
 			self._sync_toolbar_exec()
 			self._sync_panel_exec()
 			tb = self.toolbar_mod
 			if tb is not None:
 				tb.refresh_snap_highlight(self.toolbar, self._snap_enabled())
+				tb.refresh_coordspace_highlight(self.toolbar, self._coordspace() == "global")
 			p.openViewer()
 		except Exception as e:
 			self._status("OpenPanel fail: " + str(e)[:60])
 
 	# ---- Panel Execute DAT entry point (fires only on value change — idle-cheap) ----
+	def OnPanelHoldTick(self, panelValue=None):
+		"""Slim per-frame path for panel_hold_exec whileOn (rselect/mselect only).
+
+		Must stay cheap: no LMB/hover/lock thrash, no gizmo rescale. Continuous
+		orbit/pan deltas live here so valuechange cannot double-apply them.
+		Always read plain u/v (Relative UV while held) — rollu/rollv often freeze
+		while a mouse button is down and made orbit look flaky.
+		"""
+		p = self.panel
+		if p is None:
+			return
+		try:
+			rsel = int(p.panel.rselect.val)
+			msel = int(p.panel.mselect.val)
+		except Exception:
+			return
+		if not rsel and not msel:
+			return
+		try:
+			ou, ov = float(p.panel.u.val), float(p.panel.v.val)
+		except Exception:
+			return
+		try:
+			if rsel:
+				if not self._orbit_armed:
+					self._ensure_panel_uv_buttons()
+					self._set_mouse_relative(True)
+					self.Unlock()
+					self._orbit_last = (ou, ov)
+					self._orbit_armed = True
+					self._rsel_prev = 1
+				else:
+					self._orbit_update(ou, ov, aux=False)
+			if msel:
+				if not self._pan_armed:
+					self._ensure_panel_uv_buttons()
+					self._set_mouse_relative(True)
+					self.Unlock()
+					self._pan_last = (ou, ov)
+					self._pan_armed = True
+					self._msel_prev = 1
+				else:
+					self._pan_update(ou, ov, aux=False)
+		except Exception as e:
+			self._status("hold err: " + str(e)[:60])
+
 	def OnPanelValueChange(self, panelValue):
 		p = self.panel
 		if p is None:
@@ -1755,68 +1924,96 @@ class FourdesignerExt:
 		rsel_edge = bool(rsel) and not bool(self._rsel_prev)
 		msel_edge = bool(msel) and not bool(self._msel_prev)
 
-		# LMB: never pick on the button-down edge (u/v often still stale).
-		# Latch Ctrl/Alt on the edge — TD sets them at click time and they may
-		# clear before the first non-edge UV sample that arms the pick.
-		# First non-edge event while held arms + picks once; then drag.
-		if lsel:
-			if lsel_edge:
+		# Isolate each button path so a failure in LMB/select/overlay cannot
+		# skip RMB orbit or MMB pan (regression after selection-overlay work).
+		try:
+			# LMB: never pick on the button-down edge (u/v often still stale).
+			# Latch Ctrl/Alt on the edge — TD sets them at click time and they may
+			# clear before the first non-edge UV sample that arms the pick.
+			# First non-edge event while held arms + picks once; then drag.
+			if lsel:
+				if lsel_edge:
+					self._lmb_armed = False
+					self._lmb_ctrl = bool(ctrl)
+					self._lmb_alt = bool(alt)
+				if self.Drag is not None:
+					self.UpdateDrag(u, v)
+				elif not lsel_edge and not self._lmb_armed:
+					self._lmb_armed = True
+					additive = bool(ctrl) or bool(self._lmb_ctrl)
+					cycle = bool(alt) or bool(self._lmb_alt)
+					self._lmb_press(u, v, additive=additive, cycle=cycle)
+			else:
+				if self.Drag is not None:
+					self.EndDrag()
 				self._lmb_armed = False
-				self._lmb_ctrl = bool(ctrl)
-				self._lmb_alt = bool(alt)
-			if self.Drag is not None:
-				self.UpdateDrag(u, v)
-			elif not lsel_edge and not self._lmb_armed:
-				self._lmb_armed = True
-				additive = bool(ctrl) or bool(self._lmb_ctrl)
-				cycle = bool(alt) or bool(self._lmb_alt)
-				self._lmb_press(u, v, additive=additive, cycle=cycle)
-		else:
-			if self.Drag is not None:
-				self.EndDrag()
-			self._lmb_armed = False
-			self._lmb_ctrl = False
-			self._lmb_alt = False
-		self._lsel_prev = lsel
+				self._lmb_ctrl = False
+				self._lmb_alt = False
+			self._lsel_prev = lsel
+		except Exception as e:
+			self._status("lmb err: " + str(e)[:60])
+			self._lsel_prev = lsel
 
-		# RMB orbit: skip edge; seed last UV on first follow-up sample (no delta).
-		if rsel:
-			if rsel_edge:
-				self._orbit_armed = False
+		try:
+			# RMB orbit: valuechange only arms/disarms. Continuous UV samples are
+			# owned by OnPanelHoldTick (panel_hold_exec whileOn) so we don't
+			# double-apply deltas when both DATs fire in the same frame.
+			if rsel:
+				if rsel_edge or not self._orbit_armed:
+					self._ensure_panel_uv_buttons()
+					self._set_mouse_relative(True)
+					self.Unlock()
+					# Seed from plain u/v (Relative UV); do not use roll UV here.
+					self._orbit_last = (u, v)
+					self._orbit_armed = True
+			else:
+				if self._orbit_armed:
+					self._apply_orbit_camera(aux=True)
 				self._orbit_last = None
-			elif not self._orbit_armed:
-				self._orbit_last = (u, v)
-				self._orbit_armed = True
-			else:
-				self._orbit_update(u, v)
-		else:
-			self._orbit_last = None
-			self._orbit_armed = False
-		self._rsel_prev = rsel
+				self._orbit_armed = False
+			self._rsel_prev = rsel
+		except Exception as e:
+			self._status("orbit err: " + str(e)[:60])
+			self._rsel_prev = rsel
 
-		if msel:
-			if msel_edge:
-				self._pan_armed = False
+		try:
+			if msel:
+				if msel_edge or not self._pan_armed:
+					self._ensure_panel_uv_buttons()
+					self._set_mouse_relative(True)
+					self.Unlock()
+					self._pan_last = (u, v)
+					self._pan_armed = True
+			else:
+				if self._pan_armed:
+					self._apply_orbit_camera(aux=True)
 				self._pan_last = None
-			elif not self._pan_armed:
-				self._pan_last = (u, v)
-				self._pan_armed = True
-			else:
-				self._pan_update(u, v)
-		else:
-			self._pan_last = None
-			self._pan_armed = False
-		self._msel_prev = msel
+				self._pan_armed = False
+			self._msel_prev = msel
+		except Exception as e:
+			self._status("pan err: " + str(e)[:60])
+			self._msel_prev = msel
 
-		if wheel:
-			self._dolly(wheel)
+		# Restore absolute UV when no orbit/pan button is held.
+		if not rsel and not msel:
+			self._set_mouse_relative(False)
+
+		try:
+			if wheel:
+				self._dolly(wheel)
+		except Exception as e:
+			self._status("dolly err: " + str(e)[:60])
 
 		# Hover highlight / guide lines — skip while mid-drag (Drag owns feedback).
-		if not rollover:
-			self._apply_hover(None)
-		elif self.Drag is None:
-			self.UpdateHover(rollu, rollv)
+		try:
+			if not rollover:
+				self._apply_hover(None)
+			elif self.Drag is None and not self._orbit_armed and not self._pan_armed:
+				self.UpdateHover(rollu, rollv)
+		except Exception:
+			pass
 
-		# Re-lock when no button interaction (hover frame is frozen in the TOP).
-		if not active:
+		# Re-lock expensive renders only when fully idle — never while a gesture
+		# is armed (spurious rsel=0 samples used to Lock mid-orbit and kill UV).
+		if not active and not self._gesture_active():
 			self.Lock()
