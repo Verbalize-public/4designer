@@ -19,11 +19,18 @@ with identity rotation (world axes), and a drag applies the same world
 delta / scale ratio / rotation angle to every selected object independently
 (each keeps its own origin -- objects do not orbit the centroid).
 
-Known MVP limitation: translate/scale assume the selected Object COMP has
-no Object-COMP parent (its tx/ty/tz are effectively world space). Rotate is
-fully correct for Rotate Order 'xyz' (TD's default); other orders still get
-an incremental, gimbal-safe update but are decomposed via the xyz formula as
-a documented fallback (flagged in Status, not silent).
+Translate/rotate writeback goes through TD's own world matrices, not the
+local tx/ty/tz + rx/ry/rz pars directly: `start_world = sel.worldTransform`
+is captured at drag start, the world-space delta is applied to a copy of it
+(`tdu.Matrix.translate` / `.rotateOnAxis(pivot=...)`), converted back to
+that object's local space via its Object-COMP parent's world-inverse
+(`gm.object_parent_world`), and written with `sel.setTransform(...)` --
+verified live to round-trip exactly for any Object-COMP parent depth *and*
+any Rotate Order (`setTransform` respects the target's own `rord`). This is
+correct for a parented selection and for any of TD's six Rotate Orders, not
+just root-level `xyz`. Scale stays local-par (intrinsically parent- and
+order-independent); only the gizmo's own orientation needs the world fix so
+its handle axes point the right way under a rotated parent.
 """
 from __future__ import annotations
 
@@ -562,8 +569,8 @@ class FourdesignerExt:
 				self.rig.set_gizmo_mode(gizmo, None)
 				self._refresh_gizmo_feedback()
 				return
-			gizmo.par.tx, gizmo.par.ty, gizmo.par.tz = sel.par.tx.eval(), sel.par.ty.eval(), sel.par.tz.eval()
-			gizmo.par.rx, gizmo.par.ry, gizmo.par.rz = sel.par.rx.eval(), sel.par.ry.eval(), sel.par.rz.eval()
+			# World pose, not local rx/ty/rz -- correct under any Object-COMP parent.
+			gizmo.setTransform(self.gm.object_world_pose_matrix(sel))
 		else:
 			# Multi-select: world-aligned gizmo at the AABB-center average.
 			centroid = self._selection_centroid()
@@ -757,14 +764,14 @@ class FourdesignerExt:
 		}
 		for path, sel in targets:
 			t_entry = {"path": path}
-			if mode == "translate":
-				t_entry["start_values"] = {n: float(getattr(sel.par, n).eval()) for n in ("tx", "ty", "tz")}
-			elif mode == "scale":
+			if mode == "scale":
 				t_entry["start_values"] = {n: float(getattr(sel.par, n).eval()) for n in write_names}
 			else:
-				t_entry["start_rotation"] = (
-					float(sel.par.rx.eval()), float(sel.par.ry.eval()), float(sel.par.rz.eval()),
-				)
+				# translate + rotate write back through world matrices so an
+				# Object-COMP parent (any depth) and any Rotate Order both
+				# just work -- see `_write_translate` / `_apply_rotation`.
+				t_entry["start_world"] = sel.worldTransform.copy()
+				t_entry["parent_world"] = self.gm.object_parent_world(sel)
 			drag["targets"].append(t_entry)
 		if handle["kind"] == "axis":
 			drag["start_t"] = self.gm.closest_t_on_ray_to_line(origin, direction, geom["point"], geom["direction"])
@@ -778,26 +785,28 @@ class FourdesignerExt:
 		self._refresh_gizmo_feedback()
 		return True
 
-	def _write_translate(self, sel, start_values, world_delta):
-		sel.par.tx = start_values["tx"] + world_delta[0]
-		sel.par.ty = start_values["ty"] + world_delta[1]
-		sel.par.tz = start_values["tz"] + world_delta[2]
+	def _write_translate(self, sel, t_entry, world_delta):
+		"""Apply a world-space delta to `sel`'s world pose, then convert back
+		to local pars through its Object-COMP parent's world-inverse
+		(identity when unparented) -- correct at any nesting depth."""
+		new_world = t_entry["start_world"].copy()
+		new_world.translate(world_delta[0], world_delta[1], world_delta[2])
+		parent_inv = t_entry["parent_world"].getInverse()
+		sel.setTransform(parent_inv * new_world)
 
-	def _apply_rotation(self, sel, start_rotation, angle_delta_deg, world_normal):
+	def _apply_rotation(self, sel, t_entry, angle_delta_deg, world_normal):
+		"""Rotate `sel`'s world pose about its OWN world position by a
+		world-axis angle delta, then convert back to local pars. Exact for
+		any Object-COMP parent depth and any Rotate Order -- `setTransform`
+		round-trips through the target's own `rord` (verified live), so no
+		hand-rolled euler/order table is needed here."""
 		gm = self.gm
-		rord = "xyz"
-		try:
-			rord = str(sel.par.rord.eval()).lower()
-		except Exception:
-			pass
-		if rord != "xyz":
-			self._status("Rotate: rord '{}' unsupported, xyz fallback".format(rord))
-		rx0, ry0, rz0 = start_rotation
-		r_current = gm.mat3_from_euler_xyz(rx0, ry0, rz0)
-		r_delta = gm.mat3_from_axis_angle(world_normal, angle_delta_deg)
-		r_new = gm.mat3_mul(r_delta, r_current)
-		rx, ry, rz = gm.euler_xyz_from_mat3(r_new)
-		sel.par.rx, sel.par.ry, sel.par.rz = rx, ry, rz
+		start_world = t_entry["start_world"]
+		pivot = list(gm.matrix_col(start_world, 3))
+		new_world = start_world.copy()
+		new_world.rotateOnAxis(list(world_normal), angle_delta_deg, pivot=pivot)
+		parent_inv = t_entry["parent_world"].getInverse()
+		sel.setTransform(parent_inv * new_world)
 
 	def _update_gizmo_during_multi_drag(self, mode, translate_delta):
 		"""Keep the multi-select gizmo under the cursor without re-deriving
@@ -840,7 +849,7 @@ class FourdesignerExt:
 			if mode == "translate":
 				translate_delta = gm.v_scale(geom["direction"], delta_scalar)
 				for t_entry, sel in live:
-					self._write_translate(sel, t_entry["start_values"], translate_delta)
+					self._write_translate(sel, t_entry, translate_delta)
 			else:
 				ref = max(self.rig.gizmo_uniform_scale(self.gizmo), 1e-4) * self.rig.ROD_LENGTH
 				name = write_names[0]
@@ -857,7 +866,7 @@ class FourdesignerExt:
 			if mode == "translate":
 				translate_delta = world_delta
 				for t_entry, sel in live:
-					self._write_translate(sel, t_entry["start_values"], world_delta)
+					self._write_translate(sel, t_entry, world_delta)
 			else:
 				ref = max(self.rig.gizmo_uniform_scale(self.gizmo), 1e-4) * self.rig.ROD_LENGTH
 				delta_a, delta_b = gm.v_dot(world_delta, geom["a_dir"]), gm.v_dot(world_delta, geom["b_dir"])
@@ -875,7 +884,7 @@ class FourdesignerExt:
 			cur_dir = gm.v_sub(hit, geom["center"])
 			angle = gm.signed_angle_in_plane(drag["start_dir"], cur_dir, geom["normal"])
 			for t_entry, sel in live:
-				self._apply_rotation(sel, t_entry["start_rotation"], angle, geom["normal"])
+				self._apply_rotation(sel, t_entry, angle, geom["normal"])
 
 		# Keep the rig stuck to the selection; drag hit math still uses BeginDrag geom.
 		if len(self.Selected) > 1:

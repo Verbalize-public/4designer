@@ -3,7 +3,7 @@
 Direct-manipulation 3D editing for a TouchDesigner Render TOP — select, move, and rotate scene objects with on-screen gizmos, right inside the network.
 
 <p>
-  <img src="https://img.shields.io/badge/version-2.1.0-f0a020?style=flat-square" alt="v2.1.0" />
+  <img src="https://img.shields.io/badge/version-2.2.0-f0a020?style=flat-square" alt="v2.2.0" />
   <img src="https://img.shields.io/badge/TouchDesigner-2025-f0a020?style=flat-square" alt="TouchDesigner 2025" />
   <img src="https://img.shields.io/badge/license-MIT-f2ebe3?style=flat-square" alt="MIT license" />
 </p>
@@ -59,8 +59,7 @@ Moving an object in TouchDesigner usually means hunting parameters in a dialog w
 
 ## Limits
 
-- Assumes the selected Object COMP has no Object-COMP parent (transforms are effectively world-space)
-- Rotate is exact for Rotate Order `xyz` (TD's default); other orders fall back to an incremental update, flagged in Status
+- Translate and rotate respect Object-COMP parenting and all six TD Rotate Orders (`xyz`, `xzy`, `yxz`, `yzx`, `zxy`, `zyx`)
 - Scale applies to geometry only — lights and cameras use translate handles in Scale mode
 - Multi-select gizmo is world-aligned (no rotation) and only reflects position; scale/rotate still transform each object about its own origin, not the group center
 - No snapping, no world/local toggle

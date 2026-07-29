@@ -1,9 +1,13 @@
 """4designer analytic math — no Render Pick DAT, no GPU readback.
 
-Everything here is plain-float Vec3 tuples (x, y, z). TD's `tdu.Matrix` /
-`tdu.Position` are only touched at the two call sites that need TD's own
-camera matrices (`unproject_ray`, `camera_world_position`); every other
-function is pure Python so it can be unit-tested outside TD.
+Ray/plane/disc hit-tests and hover math are plain-float Vec3 tuples (x, y, z)
+so they can be unit-tested outside TD. Transform *writeback* (translate/
+rotate under an arbitrary Object-COMP parent and any Rotate Order) instead
+goes straight through TD's own `tdu.Matrix` + `ObjectCOMP.setTransform` —
+verified live (docs.derivative.ca/Matrix_Class, /ObjectCOMP_Class):
+`setTransform` round-trips exactly regardless of the target's `rord`, so
+there is no hand-rolled euler/order table here — see `object_parent_world`
+and `fourdesigner_ext.py`'s `_write_translate` / `_apply_rotation`.
 
 Convention (verified against docs.derivative.ca): TD matrices are
 column-major, right-handed, vector-on-the-right (`M * v`); translation is
@@ -82,7 +86,29 @@ def object_axis_world(comp, local_axis):
 	))
 
 
-# Back-compat aliases — cameraCOMP is just another Object COMP for this math.
+def object_world_pose_matrix(comp):
+	"""`comp`'s world transform with Scale stripped -- pure rotation + translation.
+
+	Used to place the (unparented) gizmo so its own local pars match `comp`'s
+	*world* orientation, not `comp`'s local rx/ry/rz -- correct even when
+	`comp` sits under a rotated Object-COMP parent. Basis columns are
+	normalized (via `object_axis_world`) so a non-uniform Scale on `comp`
+	never leaks into the gizmo's shape; `gizmo.setTransform(...)` round-trips
+	exactly regardless of the gizmo's own (fixed, 'xyz') Rotate Order.
+	"""
+	right = object_axis_world(comp, (1.0, 0.0, 0.0))
+	up = object_axis_world(comp, (0.0, 1.0, 0.0))
+	fwd = object_axis_world(comp, (0.0, 0.0, 1.0))
+	pos = object_world_position(comp)
+	return tdu.Matrix(
+		[right[0], right[1], right[2], 0.0],
+		[up[0], up[1], up[2], 0.0],
+		[fwd[0], fwd[1], fwd[2], 0.0],
+		[pos[0], pos[1], pos[2], 1.0],
+	)
+
+
+# Back-compat aliases — cameraCOMP is just another Object COMP for this module.
 camera_world_position = object_world_position
 
 
@@ -236,7 +262,7 @@ def signed_angle_in_plane(v_prev, v_curr, normal):
 	"""Signed angle (degrees) from `v_prev` to `v_curr`, both projected onto
 	the plane defined by `normal`. Positive = right-hand rotation about
 	`normal`. Used for the *incremental* rotate delta (never an absolute
-	angle-from-mouse-position — see rotate-order note in the plan).
+	angle-from-mouse-position) fed into `tdu.Matrix.rotateOnAxis`.
 	"""
 	n = v_normalize(normal)
 
@@ -252,62 +278,21 @@ def signed_angle_in_plane(v_prev, v_curr, normal):
 	return angle
 
 
-def mat3_mul(a, b):
-	"""3x3 matrix product (rows-of-rows tuples), `a * b`."""
-	return tuple(
-		tuple(sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3))
-		for i in range(3)
-	)
+def object_parent_world(obj):
+	"""World transform of `obj`'s nearest Object-COMP parent, or identity.
 
-
-def mat3_rot_x(deg):
-	c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
-	return ((1.0, 0.0, 0.0), (0.0, c, -s), (0.0, s, c))
-
-
-def mat3_rot_y(deg):
-	c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
-	return ((c, 0.0, s), (0.0, 1.0, 0.0), (-s, 0.0, c))
-
-
-def mat3_rot_z(deg):
-	c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
-	return ((c, -s, 0.0), (s, c, 0.0), (0.0, 0.0, 1.0))
-
-
-def mat3_from_axis_angle(axis, deg):
-	"""Rodrigues' rotation formula — world-space incremental rotation delta."""
-	x, y, z = v_normalize(axis)
-	theta = math.radians(deg)
-	c, s, t = math.cos(theta), math.sin(theta), 1.0 - math.cos(theta)
-	return (
-		(t * x * x + c, t * x * y - s * z, t * x * z + s * y),
-		(t * x * y + s * z, t * y * y + c, t * y * z - s * x),
-		(t * x * z - s * y, t * y * z + s * x, t * z * z + c),
-	)
-
-
-def mat3_from_euler_xyz(rx, ry, rz):
-	"""TD Rotate Order 'xyz' (X applied to the object first): R = Rz * Ry * Rx."""
-	return mat3_mul(mat3_rot_z(rz), mat3_mul(mat3_rot_y(ry), mat3_rot_x(rx)))
-
-
-def euler_xyz_from_mat3(r):
-	"""Inverse of `mat3_from_euler_xyz`, degrees, with a gimbal-lock fallback.
-
-	Only exact for Rotate Order 'xyz' — TD's default and the case this MVP
-	guarantees; other orders get a flagged fallback (see fourdesigner_ext.py).
+	`obj.parent(1)` is the network parent, which for 3D purposes only counts
+	if it's itself an Object COMP (has `worldTransform`) — TD's 3D parenting
+	model (docs.derivative.ca/3D_Parenting). A plain Container/Base ancestor
+	(or no parent at all) contributes nothing, so identity keeps
+	world == local for root-level objects (verified live: `parent(1)` on a
+	root Object COMP resolves to the panel's containerCOMP, which has no
+	`worldTransform`).
 	"""
-	r20 = max(-1.0, min(1.0, r[2][0]))
-	y = math.asin(-r20)
-	cy = math.cos(y)
-	if abs(cy) > 1e-6:
-		x = math.atan2(r[2][1], r[2][2])
-		z = math.atan2(r[1][0], r[0][0])
-	else:
-		z = 0.0
-		x = math.atan2(-r[1][2], r[1][1])
-	return math.degrees(x), math.degrees(y), math.degrees(z)
+	p = obj.parent(1)
+	if p is not None and hasattr(p, "worldTransform"):
+		return p.worldTransform
+	return tdu.Matrix()
 
 
 def gizmo_screen_scale(cam_world_pos, gizmo_world_pos, fov_y_deg, render_height, desired_px):
