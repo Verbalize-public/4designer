@@ -71,6 +71,8 @@ _TD_TYPES = (
 	"renderTOP",
 	"compositeTOP",
 	"transformTOP",
+	"textTOP",
+	"moviefileinTOP",
 	"textDAT",
 	"panelexecuteDAT",
 	"parameterexecuteDAT",
@@ -128,6 +130,15 @@ def _ensure_pars(comp):
 	_destroy_custom_pages(comp)
 	page = _menu_page(comp, "4designer")
 	page.appendOP("Rendertop", label="Render TOP")
+	page.appendMenu("Rendertopchoice", label="Render TOP (toolbar)")
+	# Overwrite TD's default name1/Label 1 trio immediately (empty string is invalid).
+	try:
+		comp.par.Rendertopchoice.menuNames = ["__none__"]
+		comp.par.Rendertopchoice.menuLabels = ["(none)"]
+	except Exception:
+		pass
+	comp.par.Rendertopchoice = "__none__"
+	page.appendPulse("Refreshrenders", label="Refresh Renders")
 	page.appendMenu("Mode", label="Gizmo Mode")
 	try:
 		comp.par.Mode.menuNames = ["select", "translate", "scale", "rotate"]
@@ -135,6 +146,14 @@ def _ensure_pars(comp):
 	except Exception:
 		pass
 	comp.par.Mode = "translate"
+	page.appendToggle("Snapgrid", label="Snap to Grid")
+	comp.par.Snapgrid = False
+	page.appendFloat("Snapgridx", label="Snap Grid X")
+	page.appendFloat("Snapgridy", label="Snap Grid Y")
+	page.appendFloat("Snapgridz", label="Snap Grid Z")
+	comp.par.Snapgridx = 0.1
+	comp.par.Snapgridy = 0.1
+	comp.par.Snapgridz = 0.1
 	page.appendPulse("Discover", label="Discover")
 	page.appendPulse("Resetview", label="Reset View")
 	page.appendPulse("Openpanel", label="Open Panel")
@@ -321,7 +340,8 @@ def build_fourdesigner_op(parent=None, name: str = "fourdesigner1"):
 	texec.nodeX, texec.nodeY = 300, -300
 	btn_paths = toolbar_mod.toolbar_button_paths(toolbar)
 	texec.par.panels = " ".join(btn_paths)
-	texec.par.panelvalue = "select"
+	# Containers use lselect; the Render TOP picker Button COMP uses select.
+	texec.par.panelvalue = "select lselect"
 	texec.par.valuechange = True
 	texec.par.offtoon = True
 	texec.par.ontooff = False
@@ -330,10 +350,18 @@ def build_fourdesigner_op(parent=None, name: str = "fourdesigner1"):
 	texec.par.active = True
 	texec.text = _read("toolbar_execute_callbacks.py")
 
+	# Remove obsolete field_exec if rebuilding an older tox.
+	old_fexec = comp.op("field_exec")
+	if old_fexec is not None:
+		old_fexec.destroy()
+
 	parexec = comp.op("param_exec") or comp.create(parameterexecuteDAT, "param_exec")
 	parexec.nodeX, parexec.nodeY = 300, -150
 	parexec.par.op = ".."
-	parexec.par.pars = "Rendertop Mode Discover Resetview Openpanel"
+	parexec.par.pars = (
+		"Rendertop Rendertopchoice Refreshrenders Mode Snapgrid "
+		"Discover Resetview Openpanel"
+	)
 	parexec.par.valuechange = True
 	if hasattr(parexec.par, "onpulse"):
 		parexec.par.onpulse = True
@@ -343,9 +371,11 @@ def build_fourdesigner_op(parent=None, name: str = "fourdesigner1"):
 	doc.nodeX, doc.nodeY = -300, 450
 	doc.text = (
 		"4designer\n"
-		"Set Rendertop -> pulse Open Panel -> click geo / light / camera icons, drag gizmo.\n"
-		"Toolbar: Select | Move | Rotate | Scale + Reload / Reset View. Orient cube bottom-right.\n"
-		"Self-contained -- no external process, no Render Pick DAT. See README.md.\n"
+		"Set Rendertop (toolbar picker or parameter) -> pulse Open Panel.\n"
+		"Toolbar: Select | Move | Rotate | Scale + Reload / Reset View.\n"
+		"Right cluster: Snap toggle + Render TOP menu + refresh list.\n"
+		"Orient cube bottom-right. Self-contained -- no Render Pick DAT.\n"
+		"See README.md.\n"
 	)
 
 	# Default Viewer = Control Panel Viewer for Panel COMPs.
@@ -373,6 +403,12 @@ def build_fourdesigner_op(parent=None, name: str = "fourdesigner1"):
 	comp.par.mousewheel = True
 	comp.par.reposition = "off"
 	comp.viewer = True
+
+	# Seed the toolbar Render TOP menu from the parent network.
+	try:
+		comp.ext.FourdesignerExt.RefreshRenderTopList()
+	except Exception:
+		pass
 
 	print("build_fourdesigner_op:", comp.path)
 	return comp

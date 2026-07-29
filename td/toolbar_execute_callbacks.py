@@ -1,13 +1,11 @@
-"""Panel Execute DAT callbacks — 4designer toolbar Button COMPs.
+"""Panel Execute DAT callbacks — 4designer toolbar controls.
 
-Watches `select` on each toolbar button. Off→On edge dispatches into
-FourdesignerExt (SetMode / Discover / ResetView). Mode buttons are radiodown;
-Discover / Reset View are momentary.
+Watches `select` (Button COMP picker) and `lselect` (Container faces).
+Off→On edge dispatches into FourdesignerExt.
 """
 
 
 def _ext():
-	# toolbar_exec lives under the fourdesigner COMP; toolbar is a child container.
 	return me.parent().ext.FourdesignerExt
 
 
@@ -38,7 +36,6 @@ def onOffToOn(panelValue):
 
 
 def onValueChange(panelValue):
-	# Backstop: some Button types only fire value change.
 	try:
 		if int(panelValue.val) == 1:
 			_dispatch(panelValue)

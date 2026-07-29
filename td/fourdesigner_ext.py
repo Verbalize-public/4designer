@@ -63,6 +63,8 @@ class FourdesignerExt:
 		self._orbit_armed = False
 		self._pan_armed = False
 		self.OrientHovered = None
+		# Guard against Rendertop <-> Rendertopchoice sync feedback loops.
+		self._rendertop_syncing = False
 
 	# ---- module / node access ----
 	@property
@@ -620,6 +622,14 @@ class FourdesignerExt:
 		self.OnModeChange()
 		self._status("Mode: " + mode)
 
+	def OnSnapGridChange(self):
+		"""Sync snap toggle highlight when Snapgrid par changes."""
+		enabled = self._snap_enabled()
+		tb = self.toolbar_mod
+		if tb is not None:
+			tb.refresh_snap_highlight(self.toolbar, enabled)
+		self._status("Snap: " + ("on" if enabled else "off"))
+
 	def OnToolbarButton(self, button_name):
 		"""Dispatch a toolbar Button COMP click by node name."""
 		tb = self.toolbar_mod
@@ -631,6 +641,321 @@ class FourdesignerExt:
 			return
 		if button_name == "btn_resetview":
 			self.ResetView()
+			return
+		if button_name == "btn_refreshrenders":
+			self.RefreshRenderTopList()
+			return
+		if button_name == "btn_rendertop":
+			self.OpenRenderTopMenu()
+			return
+		if button_name == "btn_snapgrid":
+			try:
+				cur = bool(self.ownerComp.par.Snapgrid.eval())
+			except Exception:
+				cur = False
+			try:
+				self.ownerComp.par.Snapgrid = not cur
+			except Exception:
+				pass
+			self.OnSnapGridChange()
+			return
+
+	# ---- Render TOP picker (parent-network scan) ----
+	# Empty string is an invalid custom Menu name in TD (defaults stick as name1/Label 1).
+	NONE_RENDER = "__none__"
+
+	def _set_rendertop_menu(self, names, labels):
+		"""Hard-replace Rendertopchoice menu entries; retry once if ghosts remain."""
+		par = self.ownerComp.par.Rendertopchoice
+		par.menuNames = list(names)
+		par.menuLabels = list(labels)
+		got = list(par.menuNames)
+		allowed = set(names)
+		if any(n not in allowed for n in got):
+			par.menuNames = list(names)
+			par.menuLabels = list(labels)
+
+	def _is_valid_render_choice(self, path):
+		"""True for NONE_RENDER or a live renderTOP path."""
+		if path == self.NONE_RENDER or path is None:
+			return True
+		if not path or not str(path).startswith("/"):
+			return False
+		try:
+			node = op(path)
+		except Exception:
+			return False
+		if node is None:
+			return False
+		try:
+			return isinstance(node, renderTOP) or (getattr(node, "OPType", "") or "") == "renderTOP"
+		except Exception:
+			return (getattr(node, "OPType", "") or "") == "renderTOP"
+
+	def RefreshRenderTopList(self):
+		"""Rebuild Rendertopchoice + toolbar field from renderTOPs in the parent network."""
+		parent = self.ownerComp.parent()
+		tops = []
+		if parent is not None:
+			try:
+				tops = list(parent.findChildren(type=renderTOP, maxDepth=1))
+			except Exception:
+				tops = []
+			# Exclude our own internal render passes if they somehow appear as siblings.
+			own = {self.render_edit, self.render_gizmo, self.render_orient}
+			tops = [t for t in tops if t not in own]
+			tops.sort(key=lambda t: t.name.lower())
+
+		paths = [self.NONE_RENDER] + [t.path for t in tops]
+		labels = ["(none)"] + [t.name for t in tops]
+		try:
+			self._set_rendertop_menu(paths, labels)
+		except Exception as e:
+			self._status("Refresh renders fail: " + str(e)[:60])
+			return
+
+		# Preserve current Rendertop if still listed; else clear to (none).
+		current_path = ""
+		try:
+			rt = self.ownerComp.par.Rendertop.eval()
+			if rt is not None:
+				current_path = rt.path
+		except Exception:
+			pass
+		if current_path in paths:
+			choice = current_path
+		else:
+			choice = self.NONE_RENDER
+
+		self._rendertop_syncing = True
+		try:
+			self.ownerComp.par.Rendertopchoice = choice
+			self._apply_rendertop_path(choice, discover=False)
+		finally:
+			self._rendertop_syncing = False
+
+		tb = self.toolbar_mod
+		if tb is not None:
+			tb.sync_rendertop_field(self.toolbar, choice, labels, paths)
+		self._status("Renders: {} in parent".format(len(tops)))
+		return paths
+
+	def _apply_rendertop_path(self, path, discover=True):
+		"""Set the Rendertop OP par from an absolute path (or clear)."""
+		if path == self.NONE_RENDER or path is None or path == "":
+			path = ""
+		elif not self._is_valid_render_choice(path):
+			self._status("Ignore non-render choice: " + str(path)[:40])
+			return
+		try:
+			if path:
+				self.ownerComp.par.Rendertop = path
+			else:
+				self.ownerComp.par.Rendertop = ""
+		except Exception as e:
+			self._status("Set Rendertop fail: " + str(e)[:60])
+			return
+		if discover:
+			self.Discover()
+
+	def _sync_rendertop_from_choice(self, discover=True):
+		"""Rendertopchoice → Rendertop OP par."""
+		if self._rendertop_syncing:
+			return
+		self._rendertop_syncing = True
+		try:
+			choice = str(self.ownerComp.par.Rendertopchoice.eval() or self.NONE_RENDER)
+			if not self._is_valid_render_choice(choice):
+				choice = self.NONE_RENDER
+				self.ownerComp.par.Rendertopchoice = choice
+			self._apply_rendertop_path(choice, discover=discover)
+			tb = self.toolbar_mod
+			if tb is not None:
+				try:
+					names = list(self.ownerComp.par.Rendertopchoice.menuNames)
+					labels = list(self.ownerComp.par.Rendertopchoice.menuLabels)
+				except Exception:
+					names, labels = [self.NONE_RENDER], ["(none)"]
+				tb.sync_rendertop_field(self.toolbar, choice, labels, names)
+		finally:
+			self._rendertop_syncing = False
+
+	def _sync_choice_from_rendertop(self):
+		"""Rendertop OP par → Rendertopchoice (+ toolbar field). Never append to menu."""
+		if self._rendertop_syncing:
+			return
+		path = ""
+		try:
+			rt = self.ownerComp.par.Rendertop.eval()
+			if rt is not None:
+				path = rt.path
+		except Exception:
+			pass
+		try:
+			names = list(self.ownerComp.par.Rendertopchoice.menuNames)
+		except Exception:
+			names = []
+		# Rebuild the full list if path is missing or ghosts are present.
+		needs_refresh = False
+		if path and path not in names:
+			needs_refresh = True
+		if any(n != self.NONE_RENDER and not str(n).startswith("/") for n in names):
+			needs_refresh = True
+		if needs_refresh:
+			self.RefreshRenderTopList()
+			return
+
+		choice = path if path else self.NONE_RENDER
+		self._rendertop_syncing = True
+		try:
+			try:
+				labels = list(self.ownerComp.par.Rendertopchoice.menuLabels)
+				names = list(self.ownerComp.par.Rendertopchoice.menuNames)
+			except Exception:
+				names, labels = [self.NONE_RENDER], ["(none)"]
+			if choice in names:
+				self.ownerComp.par.Rendertopchoice = choice
+			tb = self.toolbar_mod
+			if tb is not None:
+				tb.sync_rendertop_field(self.toolbar, choice, labels, names)
+		finally:
+			self._rendertop_syncing = False
+
+	def OnRenderTopParChange(self):
+		"""Parameter dialog Rendertop changed → sync choice + Discover."""
+		if self._rendertop_syncing:
+			return
+		self._sync_choice_from_rendertop()
+		self.Discover()
+
+	def OnRenderTopChoiceChange(self):
+		"""Rendertopchoice menu changed → sync OP + Discover."""
+		if self._rendertop_syncing:
+			return
+		self._sync_rendertop_from_choice(discover=True)
+
+	def OnRenderTopFieldChange(self, value):
+		"""Toolbar picker selected a value → set Rendertopchoice."""
+		if self._rendertop_syncing:
+			return
+		val = self.NONE_RENDER if value is None else str(value)
+		if not self._is_valid_render_choice(val):
+			self._status("Ignore non-render choice: " + val[:40])
+			return
+		try:
+			cur = str(self.ownerComp.par.Rendertopchoice.eval() or self.NONE_RENDER)
+		except Exception:
+			cur = self.NONE_RENDER
+		if val == cur:
+			self._sync_rendertop_from_choice(discover=True)
+			return
+		self._rendertop_syncing = True
+		try:
+			self.ownerComp.par.Rendertopchoice = val
+		finally:
+			self._rendertop_syncing = False
+		self._sync_rendertop_from_choice(discover=True)
+
+	def OpenRenderTopMenu(self):
+		"""Open the system PopMenu listing parent-network Render TOPs."""
+		# Always refresh so the list matches the parent network (no stale ghosts).
+		self.RefreshRenderTopList()
+		try:
+			names = list(self.ownerComp.par.Rendertopchoice.menuNames)
+			labels = list(self.ownerComp.par.Rendertopchoice.menuLabels)
+		except Exception:
+			names, labels = [self.NONE_RENDER], ["(none)"]
+		# Defense: drop any non-sentinel / non-path leftovers.
+		filtered = [
+			(n, lab)
+			for n, lab in zip(names, labels)
+			if n == self.NONE_RENDER or (str(n).startswith("/") and self._is_valid_render_choice(n))
+		]
+		if not filtered:
+			filtered = [(self.NONE_RENDER, "(none)")]
+		names = [n for n, _ in filtered]
+		labels = [lab for _, lab in filtered]
+
+		try:
+			cur = str(self.ownerComp.par.Rendertopchoice.eval() or self.NONE_RENDER)
+		except Exception:
+			cur = self.NONE_RENDER
+		checked = []
+		try:
+			idx = names.index(cur)
+			checked = [labels[idx]]
+		except Exception:
+			pass
+
+		def _on_select(info):
+			try:
+				i = int(info.get("index", -1))
+			except Exception:
+				i = -1
+			if i < 0 or i >= len(names):
+				return
+			self.OnRenderTopFieldChange(names[i])
+
+		try:
+			# Prefer the documented PopMenu shortcut; fall back to the child OP.
+			try:
+				pop = op.TDResources.PopMenu
+			except Exception:
+				pop = op.TDResources.op("popMenu")
+			pop.Open(
+				items=list(labels),
+				callback=_on_select,
+				checkedItems=checked,
+			)
+		except Exception as e:
+			self._status("Render menu fail: " + str(e)[:60])
+
+	# ---- Snap-to-grid (translate only) ----
+	def _snap_enabled(self):
+		try:
+			return bool(self.ownerComp.par.Snapgrid.eval())
+		except Exception:
+			return False
+
+	def _snap_steps(self):
+		try:
+			return (
+				float(self.ownerComp.par.Snapgridx.eval()),
+				float(self.ownerComp.par.Snapgridy.eval()),
+				float(self.ownerComp.par.Snapgridz.eval()),
+			)
+		except Exception:
+			return (0.1, 0.1, 0.1)
+
+	@staticmethod
+	def _snap_scalar(v, step):
+		if step is None or step <= 0:
+			return v
+		return round(v / step) * step
+
+	def _snap_world_pos(self, pos):
+		sx, sy, sz = self._snap_steps()
+		return (
+			self._snap_scalar(pos[0], sx),
+			self._snap_scalar(pos[1], sy),
+			self._snap_scalar(pos[2], sz),
+		)
+
+	def _snapped_world_delta(self, start_pos, world_delta):
+		"""Snap (start + delta) to the grid and return the effective delta."""
+		if not self._snap_enabled() or start_pos is None or world_delta is None:
+			return world_delta
+		new_pos = (
+			start_pos[0] + world_delta[0],
+			start_pos[1] + world_delta[1],
+			start_pos[2] + world_delta[2],
+		)
+		snapped = self._snap_world_pos(new_pos)
+		return (
+			snapped[0] - start_pos[0],
+			snapped[1] - start_pos[1],
+			snapped[2] - start_pos[2],
+		)
 
 	GIZMO_DESIRED_PX = 90.0
 
@@ -788,9 +1113,16 @@ class FourdesignerExt:
 	def _write_translate(self, sel, t_entry, world_delta):
 		"""Apply a world-space delta to `sel`'s world pose, then convert back
 		to local pars through its Object-COMP parent's world-inverse
-		(identity when unparented) -- correct at any nesting depth."""
+		(identity when unparented) -- correct at any nesting depth.
+
+		When Snapgrid is on, the final world position is quantized per axis
+		before writeback (translate only).
+		"""
+		gm = self.gm
+		start_pos = gm.matrix_col(t_entry["start_world"], 3)
+		delta = self._snapped_world_delta(start_pos, world_delta)
 		new_world = t_entry["start_world"].copy()
-		new_world.translate(world_delta[0], world_delta[1], world_delta[2])
+		new_world.translate(delta[0], delta[1], delta[2])
 		parent_inv = t_entry["parent_world"].getInverse()
 		sel.setTransform(parent_inv * new_world)
 
@@ -819,9 +1151,10 @@ class FourdesignerExt:
 		if mode == "translate" and translate_delta is not None:
 			base = self.Drag.get("start_gizmo_pos")
 			if base is not None:
-				gizmo.par.tx = base[0] + translate_delta[0]
-				gizmo.par.ty = base[1] + translate_delta[1]
-				gizmo.par.tz = base[2] + translate_delta[2]
+				delta = self._snapped_world_delta(base, translate_delta)
+				gizmo.par.tx = base[0] + delta[0]
+				gizmo.par.ty = base[1] + delta[1]
+				gizmo.par.tz = base[2] + delta[2]
 		self._rescale_gizmo()
 		self._refresh_gizmo_feedback()
 		self._sync_selected_proxies()
@@ -1154,6 +1487,11 @@ class FourdesignerExt:
 		if p is None:
 			return
 		try:
+			# Keep the picker / snap tint current when the panel opens.
+			self.RefreshRenderTopList()
+			tb = self.toolbar_mod
+			if tb is not None:
+				tb.refresh_snap_highlight(self.toolbar, self._snap_enabled())
 			p.openViewer()
 		except Exception as e:
 			self._status("OpenPanel fail: " + str(e)[:60])
