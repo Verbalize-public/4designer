@@ -745,6 +745,14 @@ class FourdesignerExt:
 			self.OpenRenderTopMenu()
 			return
 		if button_name == "btn_snapgrid":
+			# Debounce: select can report more than once per physical click.
+			try:
+				frame = absTime.frame
+			except Exception:
+				frame = None
+			if frame is not None and getattr(self, "_snap_btn_frame", None) == frame:
+				return
+			self._snap_btn_frame = frame
 			try:
 				cur = bool(self.ownerComp.par.Snapgrid.eval())
 			except Exception:

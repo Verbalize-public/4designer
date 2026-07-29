@@ -19,7 +19,6 @@ MODE_BUTTONS = (
 ACTION_BUTTONS = (
 	("btn_discover", "Reload", "Reload scene"),
 	("btn_resetview", "View", "Reset view"),
-	("btn_snapgrid", "Grid", "Snap to grid"),
 )
 
 MODE_BY_BUTTON = {name: mode for name, _lab, _tip, mode in MODE_BUTTONS}
@@ -198,12 +197,50 @@ def _make_right_group(parent, name, width, right_offset, y, height=BTN_H):
 		grp.par.bgalpha = 1.0
 	except Exception:
 		pass
+	# Pass clicks through empty group chrome so left-side buttons stay reachable
+	# when the panel is narrow and the strip overlaps.
+	try:
+		grp.par.clickthrough = True
+	except Exception:
+		pass
 	try:
 		grp.par.reposition = "off"
 	except Exception:
 		pass
 	_place_right(grp, width, right_offset, y, height=height)
+	try:
+		grp.par.layer = 8.0
+	except Exception:
+		pass
 	return grp
+
+
+def _make_snap_button(parent, x, y, width=BTN_W):
+	"""Momentary Button COMP for Snapgrid — uses `select` like the render picker."""
+	existing = parent.op("btn_snapgrid")
+	if existing is not None:
+		existing.destroy()
+	# Drop obsolete Text TOP face from older container-based Grid.
+	old_face = parent.op(_face_name("btn_snapgrid"))
+	if old_face is not None:
+		old_face.destroy()
+	btn = parent.create(buttonCOMP, "btn_snapgrid")
+	if btn.name != "btn_snapgrid":
+		btn.name = "btn_snapgrid"
+	btn.par.buttontype = "momentary"
+	btn.par.label = "Grid"
+	try:
+		btn.par.fontsize = 11
+	except Exception:
+		pass
+	btn.par.colorr, btn.par.colorg, btn.par.colorb = COLOR_IDLE
+	_place(btn, x, y, width)
+	try:
+		btn.par.layer = 20.0
+	except Exception:
+		pass
+	_set_help(btn, "Snap to grid")
+	return btn
 
 
 def _rendertop_picker(toolbar_root):
@@ -259,9 +296,10 @@ def build_toolbar(parent, name="ui_toolbar"):
 	x += ACTION_GAP
 	for bname, label, tip in ACTION_BUTTONS:
 		width = 52 if bname == "btn_discover" else BTN_W
-		bg = COLOR_IDLE if bname == "btn_snapgrid" else COLOR_ACTION
-		_make_control(root, bname, label, tip, bg, x=x, y=y, width=width)
+		_make_control(root, bname, label, tip, COLOR_ACTION, x=x, y=y, width=width)
 		x += width + BTN_GAP
+
+	_make_snap_button(root, x, y, width=BTN_W)
 
 	group_w = FIELD_W + BTN_W
 	grp = _make_right_group(root, RENDER_GROUP, group_w, 0, y, height=BTN_H)
@@ -304,8 +342,17 @@ def refresh_mode_highlight(toolbar_root, active_mode):
 def refresh_snap_highlight(toolbar_root, enabled):
 	if toolbar_root is None:
 		return
+	btn = toolbar_root.op("btn_snapgrid")
+	if btn is None:
+		return
+	r, g, b = COLOR_ACTIVE if enabled else COLOR_IDLE
+	try:
+		btn.par.colorr, btn.par.colorg, btn.par.colorb = r, g, b
+	except Exception:
+		pass
+	# Legacy container+face build.
 	face = toolbar_root.op(_face_name("btn_snapgrid"))
-	_tint_face(face, COLOR_ACTIVE if enabled else COLOR_IDLE)
+	_tint_face(face, (r, g, b))
 
 
 def sync_rendertop_field(toolbar_root, menu_value, labels, names=None):
@@ -351,6 +398,9 @@ def toolbar_button_paths(toolbar_root):
 		comp = toolbar_root.op(bname)
 		if comp is not None:
 			paths.append(comp.path)
+	snap = toolbar_root.op("btn_snapgrid")
+	if snap is not None:
+		paths.append(snap.path)
 	picker = _rendertop_picker(toolbar_root)
 	if picker is not None:
 		paths.append(picker.path)
@@ -373,3 +423,12 @@ def sync_toolbar_exec(owner_comp, toolbar_root=None):
 	paths = toolbar_button_paths(toolbar_root)
 	if paths:
 		texec.par.panels = " ".join(paths)
+	# Value Change only — Off→On + Value Change double-fires toggles.
+	try:
+		texec.par.panelvalue = "select lselect"
+		texec.par.valuechange = True
+		texec.par.offtoon = False
+		texec.par.ontooff = False
+		texec.par.active = True
+	except Exception:
+		pass

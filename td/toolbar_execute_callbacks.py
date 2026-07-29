@@ -1,7 +1,10 @@
 """Panel Execute DAT callbacks — 4designer toolbar controls.
 
 Watches `select` (Button COMP picker) and `lselect` (Container faces).
-Off→On edge dispatches into FourdesignerExt.
+Value Change (0→1) dispatches into FourdesignerExt.
+
+Keep Off→On disabled on toolbar_exec: if both are enabled, TD can fire
+both for the same edge and toggle actions (Snapgrid) cancel themselves.
 """
 
 
@@ -32,6 +35,7 @@ def _dispatch(panelValue):
 
 
 def onOffToOn(panelValue):
+	# Prefer Value Change only; kept as backstop if Off→On is re-enabled.
 	_dispatch(panelValue)
 
 

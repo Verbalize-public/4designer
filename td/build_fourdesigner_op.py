@@ -340,9 +340,11 @@ def build_fourdesigner_op(parent=None, name: str = "fourdesigner1"):
 	texec.nodeX, texec.nodeY = 300, -300
 	toolbar_mod.sync_toolbar_exec(comp, toolbar)
 	# Containers use lselect; the Render TOP picker Button COMP uses select.
+	# Only Value Change — if Off→On is also on, TD can fire both and toggle
+	# buttons (Snapgrid) undo themselves while idempotent actions look fine.
 	texec.par.panelvalue = "select lselect"
 	texec.par.valuechange = True
-	texec.par.offtoon = True
+	texec.par.offtoon = False
 	texec.par.ontooff = False
 	texec.par.whileon = False
 	texec.par.whileoff = False
