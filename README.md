@@ -3,7 +3,7 @@
 Direct-manipulation 3D editing for a TouchDesigner Render TOP — select, move, and rotate scene objects with on-screen gizmos, right inside the network.
 
 <p>
-  <img src="https://img.shields.io/badge/version-2.3.0-f0a020?style=flat-square" alt="v2.3.0" />
+  <img src="https://img.shields.io/badge/version-2.4.0-f0a020?style=flat-square" alt="v2.4.0" />
   <img src="https://img.shields.io/badge/TouchDesigner-2025-f0a020?style=flat-square" alt="TouchDesigner 2025" />
   <img src="https://img.shields.io/badge/license-MIT-f2ebe3?style=flat-square" alt="MIT license" />
 </p>
@@ -19,6 +19,7 @@ Moving an object in TouchDesigner usually means hunting parameters in a dialog w
 ## Features
 
 - Select, translate, rotate, and scale any Geometry COMP referenced by your Render TOP (scale is geometry-only)
+- Selected objects show a yellow AABB outline (visible in Select mode; one cage per object with Ctrl multiselect)
 - Ctrl+click to multi-select — the gizmo sits at the selection's center and a drag transforms every selected object at once
 - Alt+click cycles through overlapping objects at the click (front→back); Alt+Ctrl+click adds the next overlap to the selection
 - Pickable proxy icons mark lights and cameras (bulb / cone / distant arrow / camera frustum) for translate and rotate

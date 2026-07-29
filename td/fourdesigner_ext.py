@@ -91,6 +91,11 @@ class FourdesignerExt:
 		return self.ownerComp.op("proxy_icons").module
 
 	@property
+	def overlay(self):
+		dat = self.ownerComp.op("selection_overlay")
+		return dat.module if dat is not None else None
+
+	@property
 	def toolbar_mod(self):
 		dat = self.ownerComp.op("toolbar")
 		return dat.module if dat is not None else None
@@ -131,6 +136,10 @@ class FourdesignerExt:
 	@property
 	def proxies(self):
 		return self.ownerComp.op("proxies")
+
+	@property
+	def selection_root(self):
+		return self.ownerComp.op("selection1")
 
 	@property
 	def toolbar(self):
@@ -367,8 +376,18 @@ class FourdesignerExt:
 				pass
 		return paths
 
+	def _selection_geometry_paths(self):
+		overlay = self.overlay
+		root = self.selection_root
+		if overlay is None or root is None:
+			return []
+		try:
+			return list(overlay.selection_geometry_paths(root))
+		except Exception:
+			return []
+
 	def _wire_gizmo_render(self):
-		"""Assign handle Geometry COMPs to render_gizmo.
+		"""Assign handle + selection-cage Geometry COMPs to render_gizmo.
 
 		TD's Render TOP `geometry` par silently drops COMPs whose `.render` is
 		False (and rejects nullCOMPs). Force-render on → assign → restore mode
@@ -379,6 +398,7 @@ class FourdesignerExt:
 		if rend_g is None or gizmo is None:
 			return
 		paths = self._gizmo_geometry_paths()
+		paths.extend(self._selection_geometry_paths())
 		if not paths:
 			return
 		# Remember current render flags, force on, assign, restore.
@@ -390,6 +410,15 @@ class FourdesignerExt:
 					child.render = True
 			except Exception:
 				pass
+		sel_root = self.selection_root
+		if sel_root is not None:
+			for child in sel_root.children:
+				try:
+					if child.name.startswith("sel_"):
+						prev[child.path] = bool(child.render)
+						child.render = True
+				except Exception:
+					pass
 		try:
 			rend_g.par.geometry = " ".join(paths)
 		except Exception as e:
@@ -631,6 +660,62 @@ class FourdesignerExt:
 			if target is not None:
 				self.icons.sync_proxy_transform(proxy, target)
 
+	def _sync_selection_overlay(self):
+		"""Pose AABB cages + tint light/camera proxies for `self.Selected`."""
+		overlay = self.overlay
+		if overlay is None:
+			return
+		root = overlay.ensure_selection_root(self.ownerComp, "selection1")
+		selected = set(self.Selected)
+		# Refresh bounds for selected paths so cages track after transforms.
+		for path in self.Selected:
+			self._refresh_object_bounds(path)
+		entries = []
+		for path in self.Selected:
+			entry = self._object_entry(path)
+			if entry is None:
+				continue
+			entries.append({
+				"path": entry["path"],
+				"min": entry["min"],
+				"max": entry["max"],
+			})
+		prev_names = set()
+		for child in root.children:
+			try:
+				if child.name.startswith("sel_"):
+					prev_names.add(child.name)
+			except Exception:
+				pass
+		overlay.sync_selection_overlays(root, entries)
+		# Tint proxies: selected → highlight; others → default.
+		icons = self.icons
+		proxies = self.proxies
+		if proxies is not None:
+			for child in proxies.children:
+				try:
+					if not child.name.startswith("proxy_"):
+						continue
+					# Match via find: storage path isn't on the child; invert sanitize.
+					is_sel = False
+					for path in selected:
+						if icons.find_proxy_for(proxies, path) is child:
+							is_sel = True
+							break
+					overlay.set_proxy_selected(child, is_sel, icons_mod=icons)
+				except Exception:
+					pass
+		# New cages need to be listed on render_gizmo.geometry.
+		new_names = set()
+		for child in root.children:
+			try:
+				if child.name.startswith("sel_"):
+					new_names.add(child.name)
+			except Exception:
+				pass
+		if new_names != prev_names:
+			self._wire_gizmo_render()
+
 	def _sync_gizmo_to_selection(self):
 		gizmo = self.gizmo
 		if gizmo is None:
@@ -639,12 +724,14 @@ class FourdesignerExt:
 		if not self.Selected:
 			self.rig.set_gizmo_mode(gizmo, None)
 			self._refresh_gizmo_feedback()
+			self._sync_selection_overlay()
 			return
 		if len(self.Selected) == 1:
 			sel = op(self.Selected[0])
 			if sel is None:
 				self.rig.set_gizmo_mode(gizmo, None)
 				self._refresh_gizmo_feedback()
+				self._sync_selection_overlay()
 				return
 			# World pose, not local rx/ty/rz -- correct under any Object-COMP parent.
 			gizmo.setTransform(self.gm.object_world_pose_matrix(sel))
@@ -654,6 +741,7 @@ class FourdesignerExt:
 			if centroid is None:
 				self.rig.set_gizmo_mode(gizmo, None)
 				self._refresh_gizmo_feedback()
+				self._sync_selection_overlay()
 				return
 			gizmo.par.tx, gizmo.par.ty, gizmo.par.tz = centroid
 			gizmo.par.rx = gizmo.par.ry = gizmo.par.rz = 0.0
@@ -664,6 +752,7 @@ class FourdesignerExt:
 		self._rescale_gizmo()
 		self._refresh_gizmo_feedback()
 		self._sync_selected_proxies()
+		self._sync_selection_overlay()
 
 	def OnModeChange(self):
 		mode = self._current_mode()
@@ -1278,6 +1367,7 @@ class FourdesignerExt:
 		self._rescale_gizmo()
 		self._refresh_gizmo_feedback()
 		self._sync_selected_proxies()
+		self._sync_selection_overlay()
 
 	def UpdateDrag(self, u, v):
 		drag = self.Drag

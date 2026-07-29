@@ -202,12 +202,14 @@ def build_fourdesigner_op(parent=None, name: str = "fourdesigner1"):
 	gm_dat = _load_text(comp, "gizmo_math", _read("gizmo_math.py"))
 	rig_dat = _load_text(comp, "gizmo_rig", _read("gizmo_rig.py"))
 	icons_dat = _load_text(comp, "proxy_icons", _read("proxy_icons.py"))
+	sel_dat = _load_text(comp, "selection_overlay", _read("selection_overlay.py"))
 	toolbar_dat = _load_text(comp, "toolbar", _read("toolbar.py"))
 	orient_dat = _load_text(comp, "orient_gizmo", _read("orient_gizmo.py"))
 	ext_dat = _load_text(comp, "fourdesigner_ext", _read("fourdesigner_ext.py"))
 	gm_dat.nodeX, gm_dat.nodeY = -300, 300
 	rig_dat.nodeX, rig_dat.nodeY = -300, 150
 	icons_dat.nodeX, icons_dat.nodeY = -300, 75
+	sel_dat.nodeX, sel_dat.nodeY = -300, 225
 	toolbar_dat.nodeX, toolbar_dat.nodeY = -300, -75
 	orient_dat.nodeX, orient_dat.nodeY = -300, -150
 	ext_dat.nodeX, ext_dat.nodeY = -300, 0
@@ -270,6 +272,9 @@ def build_fourdesigner_op(parent=None, name: str = "fourdesigner1"):
 
 	proxies = icons_dat.module.ensure_proxies_root(comp, "proxies")
 	proxies.nodeX, proxies.nodeY = 200, 0
+
+	selection = sel_dat.module.ensure_selection_root(comp, "selection1")
+	selection.nodeX, selection.nodeY = 200, -150
 
 	# ---- Orientation view-cube (bottom-right panel overlay) ----
 	# Docked child Container (same idea as the toolbar). Transform TOP cannot
