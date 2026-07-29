@@ -20,6 +20,7 @@ Moving an object in TouchDesigner usually means hunting parameters in a dialog w
 
 - Select, translate, rotate, and scale any Geometry COMP referenced by your Render TOP (scale is geometry-only)
 - Ctrl+click to multi-select — the gizmo sits at the selection's center and a drag transforms every selected object at once
+- Alt+click cycles through overlapping objects at the click (front→back); Alt+Ctrl+click adds the next overlap to the selection
 - Pickable proxy icons mark lights and cameras (bulb / cone / distant arrow / camera frustum) for translate and rotate
 - In-viewer icon toolbar — Select / Move / Rotate / Scale, Reload, Reset View, Grid (snap) on the left; Render TOP picker + List grouped on the right
 - Choose the target Render TOP from the toolbar combobox (scans the parent network); refresh the list from the toolbar or parameters
@@ -44,6 +45,8 @@ Moving an object in TouchDesigner usually means hunting parameters in a dialog w
 | Orient cube (bottom-right) | Click a face / edge / corner to snap the edit camera |
 | LMB click | Select an object (replaces selection), or pick a gizmo handle |
 | Ctrl + LMB click | Toggle an object into/out of the selection |
+| Alt + LMB click | Cycle through overlapping objects at the click (replace selection) |
+| Alt + Ctrl + LMB click | Add the next overlapping object to the current selection |
 | LMB drag | Translate / scale / rotate the selection |
 | RMB drag | Orbit the edit camera |
 | MMB drag | Pan the edit camera |

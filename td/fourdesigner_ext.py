@@ -13,7 +13,9 @@ proxy Geometry icons under `proxies/`. Scale mode is geo-only; lights/cameras
 fall back to translate handles.
 
 Multi-select: Ctrl+click toggles an object into/out of `self.Selected` (an
-ordered list of paths); a plain click replaces the selection. With 2+ objects
+ordered list of paths); a plain click replaces the selection. Alt+click cycles
+front→back through AABB overlaps at that pixel (replace); Alt+Ctrl+click
+appends the next depth hit if not already selected. With 2+ objects
 selected, the gizmo sits at the world-space average of their AABB centers
 with identity rotation (world axes), and a drag applies the same world
 delta / scale ratio / rotation angle to every selected object independently
@@ -62,9 +64,18 @@ class FourdesignerExt:
 		self._lmb_armed = False
 		self._orbit_armed = False
 		self._pan_armed = False
+		# Latched on LMB edge — Alt/Ctrl panel vals can clear before UV arms.
+		self._lmb_ctrl = False
+		self._lmb_alt = False
 		self.OrientHovered = None
 		# Guard against Rendertop <-> Rendertopchoice sync feedback loops.
 		self._rendertop_syncing = False
+		# Last Alt depth-cycle index (optional; advance is selection-based).
+		self._pick_cycle = None
+
+	_PANEL_EXEC_VALUES = (
+		"u v lselect rselect mselect wheel rollover rollu rollv ctrl alt"
+	)
 
 	# ---- module / node access ----
 	@property
@@ -253,6 +264,7 @@ class FourdesignerExt:
 		if rt is None:
 			self._status("Discover: no Rendertop set")
 			self.Objects = []
+			self._pick_cycle = None
 			self._rebuild_proxies([], [])
 			return []
 		geos, lights, cams = [], [], []
@@ -283,11 +295,13 @@ class FourdesignerExt:
 		self._wire_edit_render(geos, lights)
 		if not self.CamSeeded and cams:
 			self.SeedCamera(cams[0])
+		self._pick_cycle = None
 		self._sync_gizmo_to_selection()
 		self._status(
 			"Discover: {} geo / {} light / {} cam".format(len(geos), len(lights), len(cams))
 		)
 		self._sync_toolbar_exec()
+		self._sync_panel_exec()
 		return table
 
 	def _rebuild_proxies(self, lights, cams):
@@ -460,17 +474,60 @@ class FourdesignerExt:
 			bmin, bmax = self._object_bounds(obj, entry["kind"])
 			entry["min"], entry["max"] = bmin, bmax
 
-	def SelectAt(self, u, v, additive=False):
-		"""Pick at panel u/v. `additive` (Ctrl held) toggles the hit into/out
-		of the selection and leaves a miss alone; otherwise a hit replaces the
-		selection and a miss clears it."""
+	def _pick_hits_at(self, u, v):
+		"""All AABB ray hits at panel u/v, front-to-back (ascending t)."""
 		self._refresh_object_bounds()
 		origin, direction = self._ray_from_panel(u, v)
-		best_path, best_t = None, None
+		hits = []
 		for entry in self.Objects:
 			t = self.gm.ray_vs_aabb(origin, direction, entry["min"], entry["max"])
-			if t is not None and (best_t is None or t < best_t):
-				best_t, best_path = t, entry["path"]
+			if t is not None:
+				hits.append((t, entry["path"]))
+		hits.sort(key=lambda h: h[0])
+		return [path for _t, path in hits]
+
+	def _advance_pick_cycle(self, paths):
+		"""Pick next depth hit after the deepest currently-selected path in `paths`.
+
+		Selection-relative (not UV-keyed) so small mouse drift between Alt clicks
+		still advances the stack. Returns (path_or_None, index, n).
+		"""
+		if not paths:
+			self._pick_cycle = None
+			return None, 0, 0
+		start = -1
+		for i, path in enumerate(paths):
+			if path in self.Selected:
+				start = i
+		index = (start + 1) % len(paths)
+		self._pick_cycle = {"paths": list(paths), "index": index}
+		return paths[index], index, len(paths)
+
+	def SelectAt(self, u, v, additive=False, cycle=False):
+		"""Pick at panel u/v.
+
+		`additive` (Ctrl): toggle closest hit (no Alt), or append cycled hit (with Alt).
+		`cycle` (Alt): walk front→back AABB overlaps at this pixel; wrap at end.
+		Without Alt, a miss clears (replace) or leaves selection alone (additive).
+		"""
+		paths = self._pick_hits_at(u, v)
+		if cycle:
+			chosen, index, n = self._advance_pick_cycle(paths)
+			if chosen is None:
+				if not additive:
+					self.Selected = []
+			elif additive:
+				# Alt+Ctrl: append next depth hit if not already selected (no toggle-off).
+				if chosen not in self.Selected:
+					self.Selected = self.Selected + [chosen]
+			else:
+				self.Selected = [chosen]
+			self._sync_gizmo_to_selection()
+			self._status_selection(depth=(index + 1, n) if n > 1 else None)
+			return chosen
+
+		self._pick_cycle = None
+		best_path = paths[0] if paths else None
 		if additive:
 			if best_path is None:
 				pass
@@ -484,22 +541,31 @@ class FourdesignerExt:
 		self._status_selection()
 		return best_path
 
-	def _status_selection(self):
+	def _status_selection(self, depth=None):
 		n = len(self.Selected)
 		scale_blocked = self._current_mode() == "scale" and bool(self._selected_kinds() & {"light", "camera"})
+		depth_suffix = ""
+		if depth is not None:
+			di, dn = depth
+			if dn > 1:
+				depth_suffix = " — depth {}/{}".format(di, dn)
 		if n == 0:
-			self._status("Selected: none")
+			self._status("Selected: none" + depth_suffix)
 		elif n == 1:
 			kind = self._selected_kind() or "none"
 			if scale_blocked:
-				self._status("Selected: {} ({}) — Scale N/A".format(self.Selected[0], kind))
+				self._status(
+					"Selected: {} ({}) — Scale N/A{}".format(self.Selected[0], kind, depth_suffix)
+				)
 			else:
-				self._status("Selected: {} ({})".format(self.Selected[0], kind))
+				self._status(
+					"Selected: {} ({}){}".format(self.Selected[0], kind, depth_suffix)
+				)
 		else:
 			if scale_blocked:
-				self._status("Selected: {} objects — Scale N/A".format(n))
+				self._status("Selected: {} objects — Scale N/A{}".format(n, depth_suffix))
 			else:
-				self._status("Selected: {} objects".format(n))
+				self._status("Selected: {} objects{}".format(n, depth_suffix))
 
 	def _distance_to_gizmo_center(self, u, v):
 		"""Closest-approach distance of the panel ray to the gizmo pivot, or None."""
@@ -647,6 +713,16 @@ class FourdesignerExt:
 			return
 		try:
 			tb.sync_toolbar_exec(self.ownerComp, self.toolbar)
+		except Exception:
+			pass
+
+	def _sync_panel_exec(self):
+		"""Ensure panel_exec monitors ctrl+alt (and the rest of the pick surface)."""
+		pexec = self.ownerComp.op("panel_exec")
+		if pexec is None:
+			return
+		try:
+			pexec.par.panelvalue = self._PANEL_EXEC_VALUES
 		except Exception:
 			pass
 
@@ -1485,18 +1561,20 @@ class FourdesignerExt:
 		self.Orbit["dist"] = max(0.25, self.Orbit["dist"] * (0.9 if wheel > 0 else 1.1))
 		self._apply_orbit_camera()
 
-	def _lmb_press(self, u, v, additive=False):
+	def _lmb_press(self, u, v, additive=False, cycle=False):
 		"""Handle a single LMB press once UV is armed (not on the button edge).
-		`additive` (Ctrl held) is forwarded to SelectAt for toggle behavior;
-		it has no effect on handle-drag / gizmo-near-miss branches."""
-		if self._current_mode() != "select" and self.Selected and self._pick_handle(u, v) is not None:
-			self.BeginDrag(u, v)
-			return
-		if self._current_mode() != "select" and self.Selected and self._ray_near_gizmo(u, v):
-			# Near-miss on the rig: ignore so we don't clear selection.
-			self._status("Gizmo near-miss")
-			return
-		self.SelectAt(u, v, additive=additive)
+		`additive` (Ctrl) / `cycle` (Alt) are forwarded to SelectAt.
+		Alt (cycle) always selects — never starts a gizmo drag — so overlaps
+		under the rig remain reachable in transform modes."""
+		if not cycle:
+			if self._current_mode() != "select" and self.Selected and self._pick_handle(u, v) is not None:
+				self.BeginDrag(u, v)
+				return
+			if self._current_mode() != "select" and self.Selected and self._ray_near_gizmo(u, v):
+				# Near-miss on the rig: ignore so we don't clear selection.
+				self._status("Gizmo near-miss")
+				return
+		self.SelectAt(u, v, additive=additive, cycle=cycle)
 
 	# ---- Idle-cook control (verified mechanism: op.lock, not a script early-out) ----
 	_LOCK_NODES = (
@@ -1526,6 +1604,7 @@ class FourdesignerExt:
 			# Keep the picker / snap tint current when the panel opens.
 			self.RefreshRenderTopList()
 			self._sync_toolbar_exec()
+			self._sync_panel_exec()
 			tb = self.toolbar_mod
 			if tb is not None:
 				tb.refresh_snap_highlight(self.toolbar, self._snap_enabled())
@@ -1546,6 +1625,11 @@ class FourdesignerExt:
 		ctrl = 0
 		try:
 			ctrl = int(p.panel.ctrl.val)
+		except Exception:
+			pass
+		alt = 0
+		try:
+			alt = int(p.panel.alt.val)
 		except Exception:
 			pass
 		wheel = 0.0
@@ -1574,19 +1658,27 @@ class FourdesignerExt:
 		msel_edge = bool(msel) and not bool(self._msel_prev)
 
 		# LMB: never pick on the button-down edge (u/v often still stale).
+		# Latch Ctrl/Alt on the edge — TD sets them at click time and they may
+		# clear before the first non-edge UV sample that arms the pick.
 		# First non-edge event while held arms + picks once; then drag.
 		if lsel:
 			if lsel_edge:
 				self._lmb_armed = False
+				self._lmb_ctrl = bool(ctrl)
+				self._lmb_alt = bool(alt)
 			if self.Drag is not None:
 				self.UpdateDrag(u, v)
 			elif not lsel_edge and not self._lmb_armed:
 				self._lmb_armed = True
-				self._lmb_press(u, v, additive=bool(ctrl))
+				additive = bool(ctrl) or bool(self._lmb_ctrl)
+				cycle = bool(alt) or bool(self._lmb_alt)
+				self._lmb_press(u, v, additive=additive, cycle=cycle)
 		else:
 			if self.Drag is not None:
 				self.EndDrag()
 			self._lmb_armed = False
+			self._lmb_ctrl = False
+			self._lmb_alt = False
 		self._lsel_prev = lsel
 
 		# RMB orbit: skip edge; seed last UV on first follow-up sample (no delta).
