@@ -296,7 +296,7 @@ def build_fourdesigner_op(parent=None, name: str = "fourdesigner1"):
 	pexec = comp.op("panel_exec") or comp.create(panelexecuteDAT, "panel_exec")
 	pexec.nodeX, pexec.nodeY = 300, 0
 	pexec.par.panels = comp.path
-	pexec.par.panelvalue = "u v lselect rselect mselect wheel rollover rollu rollv"
+	pexec.par.panelvalue = "u v lselect rselect mselect wheel rollover rollu rollv ctrl"
 	pexec.par.valuechange = True
 	pexec.par.offtoon = False
 	pexec.par.ontooff = False

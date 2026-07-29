@@ -12,6 +12,13 @@ Pick targets: Geometry COMPs (mesh AABB) plus light/camera COMPs via unlit
 proxy Geometry icons under `proxies/`. Scale mode is geo-only; lights/cameras
 fall back to translate handles.
 
+Multi-select: Ctrl+click toggles an object into/out of `self.Selected` (an
+ordered list of paths); a plain click replaces the selection. With 2+ objects
+selected, the gizmo sits at the world-space average of their AABB centers
+with identity rotation (world axes), and a drag applies the same world
+delta / scale ratio / rotation angle to every selected object independently
+(each keeps its own origin -- objects do not orbit the centroid).
+
 Known MVP limitation: translate/scale assume the selected Object COMP has
 no Object-COMP parent (its tx/ty/tz are effectively world space). Rotate is
 fully correct for Rotate Order 'xyz' (TD's default); other orders still get
@@ -31,7 +38,9 @@ class FourdesignerExt:
 		self.ownerComp = ownerComp
 		# Pick table: {path, kind, min, max} — kind is geo | light | camera.
 		self.Objects = []
-		self.Selected = None
+		# Ordered list of selected paths; last entry is the "primary" for
+		# Status/kind display when exactly one object is selected.
+		self.Selected = []
 		self.Drag = None
 		self.Hovered = None
 		self.Orbit = {"yaw": -25.0, "pitch": 20.0, "dist": 6.0, "pivot": (0.0, 0.0, 0.0)}
@@ -202,15 +211,30 @@ class FourdesignerExt:
 				return entry
 		return None
 
+	def _has_selection(self):
+		return bool(self.Selected)
+
+	def _primary_path(self):
+		"""Last selected/toggled path — used for single-selection kind/Status."""
+		return self.Selected[-1] if self.Selected else None
+
 	def _selected_kind(self):
-		entry = self._object_entry(self.Selected) if self.Selected else None
+		entry = self._object_entry(self._primary_path())
 		return entry["kind"] if entry else None
+
+	def _selected_kinds(self):
+		"""Distinct kinds across the whole selection (for mode-gating multi-select)."""
+		kinds = set()
+		for path in self.Selected:
+			entry = self._object_entry(path)
+			if entry:
+				kinds.add(entry["kind"])
+		return kinds
 
 	def _effective_mode(self):
 		"""Gizmo mode for the current selection — scale is geo-only."""
 		mode = self._current_mode()
-		kind = self._selected_kind()
-		if kind in ("light", "camera") and mode == "scale":
+		if mode == "scale" and (self._selected_kinds() & {"light", "camera"}):
 			return "translate"
 		return mode
 
@@ -244,10 +268,13 @@ class FourdesignerExt:
 			bmin, bmax = self._object_bounds(cam, "camera")
 			table.append({"path": cam.path, "kind": "camera", "min": bmin, "max": bmax})
 		self.Objects = table
+		valid_paths = {e["path"] for e in table}
+		self.Selected = [p for p in self.Selected if p in valid_paths]
 		self._rebuild_proxies(lights, cams)
 		self._wire_edit_render(geos, lights)
 		if not self.CamSeeded and cams:
 			self.SeedCamera(cams[0])
+		self._sync_gizmo_to_selection()
 		self._status(
 			"Discover: {} geo / {} light / {} cam".format(len(geos), len(lights), len(cams))
 		)
@@ -343,9 +370,9 @@ class FourdesignerExt:
 				except Exception:
 					pass
 		# Re-apply mode so visibility matches current Mode/selection.
-		if self.Selected is not None and self._current_mode() != "select":
+		if self.Selected and self._current_mode() != "select":
 			self.rig.set_gizmo_mode(gizmo, self._effective_mode())
-		elif self._current_mode() == "select" or self.Selected is None:
+		elif self._current_mode() == "select" or not self.Selected:
 			self.rig.set_gizmo_mode(gizmo, None)
 
 	def _wire_edit_render(self, geos, lights):
@@ -415,7 +442,10 @@ class FourdesignerExt:
 			bmin, bmax = self._object_bounds(obj, entry["kind"])
 			entry["min"], entry["max"] = bmin, bmax
 
-	def SelectAt(self, u, v):
+	def SelectAt(self, u, v, additive=False):
+		"""Pick at panel u/v. `additive` (Ctrl held) toggles the hit into/out
+		of the selection and leaves a miss alone; otherwise a hit replaces the
+		selection and a miss clears it."""
 		self._refresh_object_bounds()
 		origin, direction = self._ray_from_panel(u, v)
 		best_path, best_t = None, None
@@ -423,14 +453,35 @@ class FourdesignerExt:
 			t = self.gm.ray_vs_aabb(origin, direction, entry["min"], entry["max"])
 			if t is not None and (best_t is None or t < best_t):
 				best_t, best_path = t, entry["path"]
-		self.Selected = best_path
-		self._sync_gizmo_to_selection()
-		kind = self._selected_kind() or "none"
-		if kind in ("light", "camera") and self._current_mode() == "scale":
-			self._status("Selected: {} ({}) — Scale N/A".format(best_path or "none", kind))
+		if additive:
+			if best_path is None:
+				pass
+			elif best_path in self.Selected:
+				self.Selected = [p for p in self.Selected if p != best_path]
+			else:
+				self.Selected = self.Selected + [best_path]
 		else:
-			self._status("Selected: {} ({})".format(best_path or "none", kind))
+			self.Selected = [best_path] if best_path is not None else []
+		self._sync_gizmo_to_selection()
+		self._status_selection()
 		return best_path
+
+	def _status_selection(self):
+		n = len(self.Selected)
+		scale_blocked = self._current_mode() == "scale" and bool(self._selected_kinds() & {"light", "camera"})
+		if n == 0:
+			self._status("Selected: none")
+		elif n == 1:
+			kind = self._selected_kind() or "none"
+			if scale_blocked:
+				self._status("Selected: {} ({}) — Scale N/A".format(self.Selected[0], kind))
+			else:
+				self._status("Selected: {} ({})".format(self.Selected[0], kind))
+		else:
+			if scale_blocked:
+				self._status("Selected: {} objects — Scale N/A".format(n))
+			else:
+				self._status("Selected: {} objects".format(n))
 
 	def _distance_to_gizmo_center(self, u, v):
 		"""Closest-approach distance of the panel ray to the gizmo pivot, or None."""
@@ -468,29 +519,67 @@ class FourdesignerExt:
 		scale = max(self.rig.gizmo_uniform_scale(gizmo), 1e-4)
 		return dist <= self.rig.ROD_INNER * scale * 1.4
 
+	def _selection_centroid(self):
+		"""Average of selected objects' world AABB centers (multi-select pivot)."""
+		cx = cy = cz = 0.0
+		n = 0
+		for path in self.Selected:
+			entry = self._object_entry(path)
+			if entry is None:
+				continue
+			mn, mx = entry["min"], entry["max"]
+			cx += 0.5 * (mn[0] + mx[0])
+			cy += 0.5 * (mn[1] + mx[1])
+			cz += 0.5 * (mn[2] + mx[2])
+			n += 1
+		if n < 1:
+			return None
+		return (cx / n, cy / n, cz / n)
+
+	def _sync_selected_proxies(self):
+		"""Keep proxy icons stuck to every selected light/camera."""
+		for path in self.Selected:
+			entry = self._object_entry(path)
+			if entry is None or entry["kind"] not in ("light", "camera"):
+				continue
+			target = op(path)
+			proxy = self.icons.find_proxy_for(self.proxies, path)
+			if target is not None:
+				self.icons.sync_proxy_transform(proxy, target)
+
 	def _sync_gizmo_to_selection(self):
 		gizmo = self.gizmo
 		if gizmo is None:
 			return
 		self.Hovered = None
-		sel = op(self.Selected) if self.Selected else None
-		if sel is None:
+		if not self.Selected:
 			self.rig.set_gizmo_mode(gizmo, None)
 			self._refresh_gizmo_feedback()
 			return
-		gizmo.par.tx, gizmo.par.ty, gizmo.par.tz = sel.par.tx.eval(), sel.par.ty.eval(), sel.par.tz.eval()
-		gizmo.par.rx, gizmo.par.ry, gizmo.par.rz = sel.par.rx.eval(), sel.par.ry.eval(), sel.par.rz.eval()
+		if len(self.Selected) == 1:
+			sel = op(self.Selected[0])
+			if sel is None:
+				self.rig.set_gizmo_mode(gizmo, None)
+				self._refresh_gizmo_feedback()
+				return
+			gizmo.par.tx, gizmo.par.ty, gizmo.par.tz = sel.par.tx.eval(), sel.par.ty.eval(), sel.par.tz.eval()
+			gizmo.par.rx, gizmo.par.ry, gizmo.par.rz = sel.par.rx.eval(), sel.par.ry.eval(), sel.par.rz.eval()
+		else:
+			# Multi-select: world-aligned gizmo at the AABB-center average.
+			centroid = self._selection_centroid()
+			if centroid is None:
+				self.rig.set_gizmo_mode(gizmo, None)
+				self._refresh_gizmo_feedback()
+				return
+			gizmo.par.tx, gizmo.par.ty, gizmo.par.tz = centroid
+			gizmo.par.rx = gizmo.par.ry = gizmo.par.rz = 0.0
 		if self._current_mode() == "select":
 			self.rig.set_gizmo_mode(gizmo, None)
 		else:
 			self.rig.set_gizmo_mode(gizmo, self._effective_mode())
 		self._rescale_gizmo()
 		self._refresh_gizmo_feedback()
-		# Keep icon stuck to the selected light/camera.
-		kind = self._selected_kind()
-		if kind in ("light", "camera"):
-			proxy = self.icons.find_proxy_for(self.proxies, self.Selected)
-			self.icons.sync_proxy_transform(proxy, sel)
+		self._sync_selected_proxies()
 
 	def OnModeChange(self):
 		mode = self._current_mode()
@@ -498,9 +587,9 @@ class FourdesignerExt:
 		if tb is not None:
 			tb.refresh_mode_highlight(self.toolbar, mode)
 		gizmo = self.gizmo
-		if gizmo is not None and self.Selected is not None:
+		if gizmo is not None and self.Selected:
 			eff = self._effective_mode()
-			if mode == "scale" and self._selected_kind() in ("light", "camera"):
+			if mode == "scale" and (self._selected_kinds() & {"light", "camera"}):
 				self._status("Scale N/A for light/camera")
 			elif mode == "select":
 				self.rig.set_gizmo_mode(gizmo, None)
@@ -556,7 +645,7 @@ class FourdesignerExt:
 		"""Pick the hovered handle (or center zone) from rollu/rollv."""
 		if self.Drag is not None:
 			return
-		if self.gizmo is None or self.Selected is None or self._current_mode() == "select":
+		if self.gizmo is None or not self.Selected or self._current_mode() == "select":
 			self._apply_hover(None)
 			return
 		handle_id = self._pick_handle(u, v)
@@ -626,7 +715,7 @@ class FourdesignerExt:
 
 	def _pick_handle(self, u, v):
 		gizmo = self.gizmo
-		if gizmo is None or self.Selected is None:
+		if gizmo is None or not self.Selected:
 			return None
 		origin, direction = self._ray_from_panel(u, v)
 		mode = self._effective_mode()
@@ -641,13 +730,13 @@ class FourdesignerExt:
 		return best_id
 
 	def BeginDrag(self, u, v):
-		if self.Selected is None or self.gizmo is None:
+		if not self.Selected or self.gizmo is None:
 			return False
 		handle_id = self._pick_handle(u, v)
 		if handle_id is None:
 			return False
-		sel = op(self.Selected)
-		if sel is None:
+		targets = [(path, op(path)) for path in self.Selected]
+		if any(sel is None for _, sel in targets):
 			return False
 		mode = self._effective_mode()
 		handle = self.rig.HANDLES_BY_ID[handle_id]
@@ -656,15 +745,27 @@ class FourdesignerExt:
 			return False
 		origin, direction = self._ray_from_panel(u, v)
 		geom = self.rig.handle_world_geometry(self.gizmo, handle)
-		drag = {"handle": handle, "mode": mode, "geom": geom}
-		if mode == "translate":
-			drag["start_values"] = {n: float(getattr(sel.par, n).eval()) for n in ("tx", "ty", "tz")}
-		elif mode == "scale":
-			drag["start_values"] = {n: float(getattr(sel.par, n).eval()) for n in write_names}
-		else:
-			drag["start_rotation"] = (
-				float(sel.par.rx.eval()), float(sel.par.ry.eval()), float(sel.par.rz.eval()),
-			)
+		gizmo = self.gizmo
+		drag = {
+			"handle": handle,
+			"mode": mode,
+			"geom": geom,
+			"start_gizmo_pos": (
+				float(gizmo.par.tx.eval()), float(gizmo.par.ty.eval()), float(gizmo.par.tz.eval()),
+			),
+			"targets": [],
+		}
+		for path, sel in targets:
+			t_entry = {"path": path}
+			if mode == "translate":
+				t_entry["start_values"] = {n: float(getattr(sel.par, n).eval()) for n in ("tx", "ty", "tz")}
+			elif mode == "scale":
+				t_entry["start_values"] = {n: float(getattr(sel.par, n).eval()) for n in write_names}
+			else:
+				t_entry["start_rotation"] = (
+					float(sel.par.rx.eval()), float(sel.par.ry.eval()), float(sel.par.rz.eval()),
+				)
+			drag["targets"].append(t_entry)
 		if handle["kind"] == "axis":
 			drag["start_t"] = self.gm.closest_t_on_ray_to_line(origin, direction, geom["point"], geom["direction"])
 		elif handle["kind"] == "plane":
@@ -677,13 +778,12 @@ class FourdesignerExt:
 		self._refresh_gizmo_feedback()
 		return True
 
-	def _write_translate(self, sel, drag, world_delta):
-		start = drag["start_values"]
-		sel.par.tx = start["tx"] + world_delta[0]
-		sel.par.ty = start["ty"] + world_delta[1]
-		sel.par.tz = start["tz"] + world_delta[2]
+	def _write_translate(self, sel, start_values, world_delta):
+		sel.par.tx = start_values["tx"] + world_delta[0]
+		sel.par.ty = start_values["ty"] + world_delta[1]
+		sel.par.tz = start_values["tz"] + world_delta[2]
 
-	def _apply_rotation(self, sel, drag, angle_delta_deg, world_normal):
+	def _apply_rotation(self, sel, start_rotation, angle_delta_deg, world_normal):
 		gm = self.gm
 		rord = "xyz"
 		try:
@@ -692,25 +792,45 @@ class FourdesignerExt:
 			pass
 		if rord != "xyz":
 			self._status("Rotate: rord '{}' unsupported, xyz fallback".format(rord))
-		rx0, ry0, rz0 = drag["start_rotation"]
+		rx0, ry0, rz0 = start_rotation
 		r_current = gm.mat3_from_euler_xyz(rx0, ry0, rz0)
 		r_delta = gm.mat3_from_axis_angle(world_normal, angle_delta_deg)
 		r_new = gm.mat3_mul(r_delta, r_current)
 		rx, ry, rz = gm.euler_xyz_from_mat3(r_new)
 		sel.par.rx, sel.par.ry, sel.par.rz = rx, ry, rz
 
+	def _update_gizmo_during_multi_drag(self, mode, translate_delta):
+		"""Keep the multi-select gizmo under the cursor without re-deriving
+		its pose from (possibly stale, un-refreshed) per-object AABB centers.
+		Translate moves the rig by the same world delta as the objects;
+		rotate/scale act in place on each object so the rig pose is static."""
+		gizmo = self.gizmo
+		if gizmo is None or self.Drag is None:
+			return
+		if mode == "translate" and translate_delta is not None:
+			base = self.Drag.get("start_gizmo_pos")
+			if base is not None:
+				gizmo.par.tx = base[0] + translate_delta[0]
+				gizmo.par.ty = base[1] + translate_delta[1]
+				gizmo.par.tz = base[2] + translate_delta[2]
+		self._rescale_gizmo()
+		self._refresh_gizmo_feedback()
+		self._sync_selected_proxies()
+
 	def UpdateDrag(self, u, v):
 		drag = self.Drag
 		if drag is None:
 			return False
-		sel = op(self.Selected) if self.Selected else None
-		if sel is None:
+		targets = drag.get("targets") or []
+		live = [(t, op(t["path"])) for t in targets]
+		if not live or any(sel is None for _, sel in live):
 			self.Drag = None
 			return False
 		gm = self.gm
 		origin, direction = self._ray_from_panel(u, v)
 		handle, geom, mode = drag["handle"], drag["geom"], drag["mode"]
 		write_names = handle["write"][mode]
+		translate_delta = None
 
 		if handle["kind"] == "axis":
 			t_now = gm.closest_t_on_ray_to_line(origin, direction, geom["point"], geom["direction"])
@@ -718,12 +838,16 @@ class FourdesignerExt:
 				return True
 			delta_scalar = t_now - drag["start_t"]
 			if mode == "translate":
-				self._write_translate(sel, drag, gm.v_scale(geom["direction"], delta_scalar))
+				translate_delta = gm.v_scale(geom["direction"], delta_scalar)
+				for t_entry, sel in live:
+					self._write_translate(sel, t_entry["start_values"], translate_delta)
 			else:
 				ref = max(self.rig.gizmo_uniform_scale(self.gizmo), 1e-4) * self.rig.ROD_LENGTH
 				name = write_names[0]
-				start = drag["start_values"][name]
-				setattr(sel.par, name, max(start * (1.0 + delta_scalar / ref), 1e-4))
+				ratio = 1.0 + delta_scalar / ref
+				for t_entry, sel in live:
+					start = t_entry["start_values"][name]
+					setattr(sel.par, name, max(start * ratio, 1e-4))
 
 		elif handle["kind"] == "plane":
 			hit = gm.ray_vs_plane(origin, direction, geom["point"], geom["normal"])
@@ -731,14 +855,18 @@ class FourdesignerExt:
 				return True
 			world_delta = gm.v_sub(hit, drag["start_hit"])
 			if mode == "translate":
-				self._write_translate(sel, drag, world_delta)
+				translate_delta = world_delta
+				for t_entry, sel in live:
+					self._write_translate(sel, t_entry["start_values"], world_delta)
 			else:
 				ref = max(self.rig.gizmo_uniform_scale(self.gizmo), 1e-4) * self.rig.ROD_LENGTH
 				delta_a, delta_b = gm.v_dot(world_delta, geom["a_dir"]), gm.v_dot(world_delta, geom["b_dir"])
 				name_a, name_b = write_names
-				start_a, start_b = drag["start_values"][name_a], drag["start_values"][name_b]
-				setattr(sel.par, name_a, max(start_a * (1.0 + delta_a / ref), 1e-4))
-				setattr(sel.par, name_b, max(start_b * (1.0 + delta_b / ref), 1e-4))
+				ratio_a, ratio_b = 1.0 + delta_a / ref, 1.0 + delta_b / ref
+				for t_entry, sel in live:
+					start_a, start_b = t_entry["start_values"][name_a], t_entry["start_values"][name_b]
+					setattr(sel.par, name_a, max(start_a * ratio_a, 1e-4))
+					setattr(sel.par, name_b, max(start_b * ratio_b, 1e-4))
 
 		else:  # disc / rotate
 			hit = gm.ray_vs_plane(origin, direction, geom["center"], geom["normal"])
@@ -746,16 +874,19 @@ class FourdesignerExt:
 				return True
 			cur_dir = gm.v_sub(hit, geom["center"])
 			angle = gm.signed_angle_in_plane(drag["start_dir"], cur_dir, geom["normal"])
-			self._apply_rotation(sel, drag, angle, geom["normal"])
+			for t_entry, sel in live:
+				self._apply_rotation(sel, t_entry["start_rotation"], angle, geom["normal"])
 
-		# Keep the rig stuck to the object; drag hit math still uses BeginDrag geom.
-		self._sync_gizmo_to_selection()
+		# Keep the rig stuck to the selection; drag hit math still uses BeginDrag geom.
+		if len(self.Selected) > 1:
+			self._update_gizmo_during_multi_drag(mode, translate_delta)
+		else:
+			self._sync_gizmo_to_selection()
 		return True
 
 	def EndDrag(self):
-		path = self.Selected
 		self.Drag = None
-		self._refresh_object_bounds(path)
+		self._refresh_object_bounds()
 		self._sync_all_proxies()
 		self._sync_gizmo_to_selection()
 		self._status("Drag end")
@@ -976,16 +1107,18 @@ class FourdesignerExt:
 		self.Orbit["dist"] = max(0.25, self.Orbit["dist"] * (0.9 if wheel > 0 else 1.1))
 		self._apply_orbit_camera()
 
-	def _lmb_press(self, u, v):
-		"""Handle a single LMB press once UV is armed (not on the button edge)."""
-		if self._current_mode() != "select" and self.Selected is not None and self._pick_handle(u, v) is not None:
+	def _lmb_press(self, u, v, additive=False):
+		"""Handle a single LMB press once UV is armed (not on the button edge).
+		`additive` (Ctrl held) is forwarded to SelectAt for toggle behavior;
+		it has no effect on handle-drag / gizmo-near-miss branches."""
+		if self._current_mode() != "select" and self.Selected and self._pick_handle(u, v) is not None:
 			self.BeginDrag(u, v)
 			return
-		if self._current_mode() != "select" and self.Selected is not None and self._ray_near_gizmo(u, v):
+		if self._current_mode() != "select" and self.Selected and self._ray_near_gizmo(u, v):
 			# Near-miss on the rig: ignore so we don't clear selection.
 			self._status("Gizmo near-miss")
 			return
-		self.SelectAt(u, v)
+		self.SelectAt(u, v, additive=additive)
 
 	# ---- Idle-cook control (verified mechanism: op.lock, not a script early-out) ----
 	_LOCK_NODES = (
@@ -1026,6 +1159,11 @@ class FourdesignerExt:
 			lsel, rsel, msel = int(p.panel.lselect.val), int(p.panel.rselect.val), int(p.panel.mselect.val)
 		except Exception:
 			return
+		ctrl = 0
+		try:
+			ctrl = int(p.panel.ctrl.val)
+		except Exception:
+			pass
 		wheel = 0.0
 		try:
 			wheel = float(p.panel.wheel.val)
@@ -1060,7 +1198,7 @@ class FourdesignerExt:
 				self.UpdateDrag(u, v)
 			elif not lsel_edge and not self._lmb_armed:
 				self._lmb_armed = True
-				self._lmb_press(u, v)
+				self._lmb_press(u, v, additive=bool(ctrl))
 		else:
 			if self.Drag is not None:
 				self.EndDrag()
