@@ -8,6 +8,14 @@ Direct-manipulation 3D editing for a TouchDesigner Render TOP — select, move, 
   <img src="https://img.shields.io/badge/license-MIT-f2ebe3?style=flat-square" alt="MIT license" />
 </p>
 
+## See it in action
+
+[![4designer panel — Move mode with world-aligned gizmo and orientation cube](docs/img/demo.gif)](docs/img/demo.mp4)
+
+[![4designer Open Panel — selected torus with translate gizmo](docs/img/panel.png)](docs/img/demo.mp4)
+
+<sub>▶ [Watch a short clip](docs/img/demo.mp4) · In-viewer toolbar, selection cages, Local/Global gizmo, orientation cube. Drop in a `.tox` — no browser tab.</sub>
+
 ## Why
 
 Moving an object in TouchDesigner usually means hunting parameters in a dialog while the render sits somewhere else on screen. 4designer puts a click-and-drag gizmo directly over your live render: click a geo, light, or camera, drag a handle, and the real Object COMP updates at cook time.
